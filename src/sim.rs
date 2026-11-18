@@ -268,8 +268,175 @@ impl Default for TelemetrySnapshot {
     }
 }
 
-/// Per-cylinder acoustic micro-asymmetry for organic sub-harmonic texture
-const CYL_TRIM: [f64; NUM_CYL] = [1.00, 0.95, 1.04, 0.97, 1.02, 0.99, 1.05, 0.96, 1.01, 0.94];
+/// Engine-Sim IR file (MIT-licensed from ange-yaghi/engine-sim)
+const IR_WAV_BYTES: &[u8] = include_bytes!("../assets/minimal_muffling_01.wav");
+
+/// Per-cylinder primary offsets (m) and acoustic attenuation from engine-sim V10 specs
+const PRIMARY_OFFSETS_M: [f64; NUM_CYL] = [0.05, 0.04, 0.03, 0.02, 0.01, 0.05, 0.04, 0.03, 0.02, 0.01];
+const SOUND_ATTENUATION: [f32; NUM_CYL] = [0.8, 1.0, 1.1, 0.9, 0.7, 0.7, 0.8, 1.0, 1.1, 0.7];
+const PRIMARY_BASE_LEN_M: f64 = 0.45;
+const BANK_COLLECTOR_LEN_M: [f64; 2] = [0.55, 0.60];
+
+/// Compressible finite-volume gas node (ported from engine-sim's GasSystem)
+#[derive(Clone, Copy)]
+struct GasNode {
+    n_mass: f64,
+    e_internal: f64,
+    volume: f64,
+    area: f64,
+    length: f64,
+    momentum_x: f64,
+}
+
+impl GasNode {
+    fn new(volume: f64, area: f64) -> Self {
+        let length = (volume / area.max(1e-6)).max(0.05);
+        let n_mass = (P_ATM * volume) / (R_AIR * T_ATM);
+        let e_internal = n_mass * CV_GAS * T_ATM;
+        Self {
+            n_mass,
+            e_internal,
+            volume,
+            area,
+            length,
+            momentum_x: 0.0,
+        }
+    }
+
+    #[inline]
+    fn temp_k(&self) -> f64 {
+        (self.e_internal / (self.n_mass.max(1e-8) * CV_GAS)).clamp(200.0, 3400.0)
+    }
+
+    #[inline]
+    fn pressure_pa(&self) -> f64 {
+        (self.e_internal * (GAMMA_AIR - 1.0) / self.volume).clamp(8_000.0, 4.0e6)
+    }
+
+    #[inline]
+    fn speed_of_sound(&self) -> f64 {
+        (GAMMA_AIR * R_AIR * self.temp_k()).sqrt()
+    }
+
+    #[inline]
+    fn dynamic_pressure(&self, dir_x: f64) -> f64 {
+        if self.n_mass <= 1e-8 || self.e_internal <= 1e-8 {
+            return 0.0;
+        }
+        let v = (self.momentum_x / self.n_mass) * dir_x;
+        if v <= 0.0 {
+            return 0.0;
+        }
+        let p_static = self.pressure_pa();
+        let c = self.speed_of_sound();
+        let mach2 = ((v * v) / (c * c)).min(1.0);
+        let x = 1.0 + 0.5 * (GAMMA_AIR - 1.0) * mach2;
+        p_static * (x.powf(GAMMA_AIR / (GAMMA_AIR - 1.0)) - 1.0)
+    }
+
+    #[inline]
+    fn dissipate_excess_velocity(&mut self) {
+        if self.n_mass <= 1e-8 {
+            self.momentum_x = 0.0;
+            return;
+        }
+        let v = self.momentum_x / self.n_mass;
+        let c = self.speed_of_sound();
+        if v.abs() > c {
+            let v_new = c * v.signum();
+            let de_k = 0.5 * self.n_mass * (v * v - v_new * v_new);
+            self.momentum_x = self.n_mass * v_new;
+            self.e_internal = (self.e_internal + de_k).max(self.n_mass * CV_GAS * 200.0);
+        }
+    }
+
+    #[inline]
+    fn update_velocity(&mut self, dt: f64, beta: f64) {
+        if self.n_mass <= 1e-8 {
+            return;
+        }
+        let p_fwd = self.dynamic_pressure(1.0);
+        let p_bwd = self.dynamic_pressure(-1.0);
+        let d_mom = (p_fwd - p_bwd) * self.area * dt * beta;
+        let v0 = self.momentum_x / self.n_mass;
+        self.momentum_x = (self.momentum_x - d_mom).clamp(-self.n_mass * 900.0, self.n_mass * 900.0);
+        let v1 = self.momentum_x / self.n_mass;
+        self.e_internal = (self.e_internal - 0.5 * self.n_mass * (v1 * v1 - v0 * v0))
+            .max(self.n_mass * CV_GAS * 200.0);
+        let _ = self.length;
+    }
+
+    #[inline]
+    fn add_flow_from_cylinder(&mut self, dm: f64, cyl_temp: f64, dt: f64) {
+        let m_old = self.n_mass.max(1e-8);
+        let c = self.speed_of_sound();
+        if dm > 0.0 {
+            let dm_safe = dm.min(m_old * 0.45);
+            let rho = (m_old / self.volume).max(0.05);
+            let v_jet = ((dm_safe / dt.max(1e-7)) / (rho * self.area)).clamp(0.0, c);
+            self.n_mass += dm_safe;
+            self.e_internal += dm_safe * GAMMA_AIR * CV_GAS * cyl_temp;
+            self.momentum_x += v_jet * dm_safe;
+        } else if dm < 0.0 {
+            let out = (-dm).min(m_old * 0.35);
+            let frac = out / m_old;
+            self.n_mass -= out;
+            self.e_internal *= 1.0 - frac;
+            self.momentum_x *= 1.0 - frac;
+        }
+    }
+
+    #[inline]
+    fn flow_to_node(&mut self, sink: &mut GasNode, dt: f64, flow_area: f64) {
+        let p0 = self.pressure_pa() + self.dynamic_pressure(1.0);
+        let p1 = sink.pressure_pa() + sink.dynamic_pressure(-1.0);
+        let dm_rate = orifice_mass_flow(p0, self.temp_k(), p1, sink.temp_k(), flow_area);
+        let mut dm = dm_rate * dt;
+        let max_src = self.n_mass * 0.25;
+        let max_snk = sink.n_mass * 0.25;
+        dm = dm.clamp(-max_snk, max_src);
+        if dm > 0.0 {
+            let frac = dm / self.n_mass.max(1e-8);
+            let de = self.e_internal * GAMMA_AIR * frac;
+            let dp = self.momentum_x * frac;
+            let rho_snk = (sink.n_mass / sink.volume).max(0.05);
+            let v_jet = ((dm / dt.max(1e-7)) / (rho_snk * sink.area)).clamp(0.0, sink.speed_of_sound());
+            self.n_mass -= dm;
+            self.e_internal = (self.e_internal - de).max(self.n_mass * CV_GAS * 200.0);
+            self.momentum_x -= dp;
+            sink.n_mass += dm;
+            sink.e_internal += de;
+            sink.momentum_x += dp + v_jet * dm;
+        } else if dm < 0.0 {
+            let back = -dm;
+            let frac = back / sink.n_mass.max(1e-8);
+            let de = sink.e_internal * GAMMA_AIR * frac;
+            sink.n_mass -= back;
+            sink.e_internal = (sink.e_internal - de).max(sink.n_mass * CV_GAS * 200.0);
+            sink.momentum_x *= 1.0 - frac;
+            self.n_mass += back;
+            self.e_internal += de;
+        }
+    }
+
+    #[inline]
+    fn flow_to_atmosphere(&mut self, dt: f64, flow_area: f64) {
+        let p0 = self.pressure_pa() + self.dynamic_pressure(1.0);
+        let dm_rate = orifice_mass_flow(p0, self.temp_k(), P_ATM, T_ATM, flow_area);
+        let dm = (dm_rate * dt).clamp(-self.n_mass * 0.2, self.n_mass * 0.35);
+        if dm > 0.0 {
+            let frac = dm / self.n_mass.max(1e-8);
+            self.n_mass -= dm;
+            self.e_internal = (self.e_internal * (1.0 - GAMMA_AIR * frac))
+                .max(self.n_mass * CV_GAS * 200.0);
+            self.momentum_x *= 1.0 - frac;
+        } else if dm < 0.0 {
+            let inflow = -dm;
+            self.n_mass += inflow;
+            self.e_internal += inflow * GAMMA_AIR * CV_GAS * T_ATM;
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 struct Cylinder {
@@ -285,23 +452,23 @@ struct Cylinder {
     comb_start_rad: f64,
     comb_energy_total: f64,
     prev_local_angle: f64,
-    prev_ex_lift: f64,
     spark_timer: f64,
     knock_timer: f64,
     last_intake_mass: f64,
     intake_accum_mass: f64,
-    ex_flow_pulse: f64,
-    in_flow_pulse: f64,
     intake_lift: f64,
     exhaust_lift: f64,
     piston_x: f64,
     spark_cut_this_cycle: bool,
+    runner_gas: GasNode,
 }
 
 impl Cylinder {
-    fn new(firing_offset_rad: f64) -> Self {
+    fn new(idx: usize, firing_offset_rad: f64) -> Self {
         let vol = CLEARANCE_VOL_M3;
         let air_mass = (P_ATM * vol) / (R_AIR * T_ATM);
+        let runner_area = 0.00185;
+        let runner_vol = 50.0e-6 + runner_area * (PRIMARY_BASE_LEN_M + PRIMARY_OFFSETS_M[idx]);
         Self {
             firing_offset_rad,
             air_mass,
@@ -315,223 +482,320 @@ impl Cylinder {
             comb_start_rad: 0.0,
             comb_energy_total: 0.0,
             prev_local_angle: 0.0,
-            prev_ex_lift: 0.0,
             spark_timer: 0.0,
             knock_timer: 0.0,
             last_intake_mass: 0.0,
             intake_accum_mass: 0.0,
-            ex_flow_pulse: 0.0,
-            in_flow_pulse: 0.0,
             intake_lift: 0.0,
             exhaust_lift: 0.0,
             piston_x: 0.0,
             spark_cut_this_cycle: false,
+            runner_gas: GasNode::new(runner_vol, runner_area),
         }
     }
 }
 
-#[inline]
-fn read_frac(buf: &[f32], mask: usize, write_ptr: usize, delay_samples: f32) -> f32 {
-    let len = mask + 1;
-    let clamped = delay_samples.clamp(2.0, (len - 4) as f32);
-    let d0 = clamped.floor() as usize;
-    let frac = clamped - d0 as f32;
-    let i0 = (write_ptr + len - d0) & mask;
-    let i1 = (write_ptr + len - (d0 + 1)) & mask;
-    buf[i0] * (1.0 - frac) + buf[i1] * frac
+/// Fixed-sample delay line (ported from engine-sim's DelayFilter)
+struct DelayFilter {
+    buf: Vec<f32>,
+    ptr: usize,
+    delay: usize,
 }
 
-/// 1D Nonlinear Shock-Steepening Waveguide for one 5-into-1 bank exhaust manifold & tailpipe
-struct BankWaveguide {
-    pri_bufs: [[f32; 128]; 5],
-    pri_ptrs: [usize; 5],
-    pri_delays: [usize; 5],
-    pri_last: [f32; 5],
-    tail_buf: [f32; 256],
-    tail_ptr: usize,
-    tail_delay: usize,
-    tail_lp: f32,
-    prev_col: f32,
-    pop_env: f32,
-}
-
-impl BankWaveguide {
-    fn new(sample_rate: f64) -> Self {
-        // Slight realistic primary length stagger (0.39m .. 0.44m) gives authentic 5-into-1 F1 rasp
-        let pri_lengths = [0.395, 0.415, 0.435, 0.425, 0.405];
-        let c_ex = 580.0; // speed of sound in hot F1 exhaust gas
-        let mut pri_delays = [24usize; 5];
-        for i in 0..5 {
-            let d = ((pri_lengths[i] / c_ex) * sample_rate).round() as usize;
-            pri_delays[i] = d.clamp(6, 120);
-        }
-        let tail_delay = (((0.78 / c_ex) * sample_rate).round() as usize).clamp(16, 240);
+impl DelayFilter {
+    fn new(delay_sec: f64, sample_rate: f64) -> Self {
+        let delay = (delay_sec * sample_rate).round().max(1.0) as usize;
         Self {
-            pri_bufs: [[0.0; 128]; 5],
-            pri_ptrs: [0; 5],
-            pri_delays,
-            pri_last: [0.0; 5],
-            tail_buf: [0.0; 256],
-            tail_ptr: 0,
-            tail_delay,
-            tail_lp: 0.0,
-            prev_col: 0.0,
-            pop_env: 0.0,
-        }
-    }
-
-    fn step(&mut self, cyl_drives: [f32; 5], pop_noise: f32) -> f32 {
-        let mut collector_sum = 0.0f32;
-        for c in 0..5 {
-            let p = self.pri_ptrs[c];
-            // Pressure-dependent acoustic propagation speed steepens high-pressure wavefronts
-            let d_eff = (self.pri_delays[c] as f32) - (self.pri_last[c] * 1.8).clamp(-3.0, 3.0);
-            let delayed = read_frac(&self.pri_bufs[c], 127, p, d_eff);
-            self.pri_last[c] = delayed;
-
-            let wave = cyl_drives[c] + delayed * 0.48;
-            self.pri_bufs[c][p] = wave.clamp(-8.0, 8.0);
-            self.pri_ptrs[c] = (p + 1) & 127;
-            collector_sum += delayed;
-        }
-
-        // Unburnt fuel overrun / shift crackle
-        collector_sum += self.pop_env * pop_noise;
-        self.pop_env *= 0.992;
-
-        // 5-into-1 Tailpipe Waveguide with nonlinear steepening & bright open-end reflection
-        let tp = self.tail_ptr;
-        let t_eff = (self.tail_delay as f32) - (self.prev_col * 1.8).clamp(-3.0, 3.0);
-        let tail_del = read_frac(&self.tail_buf, 255, tp, t_eff);
-        self.tail_lp += 0.72 * (tail_del - self.tail_lp);
-
-        let col_wave = (collector_sum * 0.42 - 0.62 * self.tail_lp).clamp(-8.0, 8.0);
-        self.tail_buf[tp] = col_wave;
-        self.tail_ptr = (tp + 1) & 255;
-
-        // Open pipe end radiation (strong high-pass derivative preserves supersonic crackle)
-        let diff = col_wave - self.prev_col;
-        self.prev_col = col_wave;
-        let raw_rad = diff * 2.2 + col_wave * 0.42;
-        (raw_rad * 1.35 + 0.20 * raw_rad * raw_rad).tanh()
-    }
-}
-
-/// Peaking EQ Biquad for the Inconel Megaphone Formant Resonator
-#[derive(Clone, Copy)]
-struct BiquadFilter {
-    b0: f32,
-    b1: f32,
-    b2: f32,
-    a1: f32,
-    a2: f32,
-    x1: f32,
-    x2: f32,
-    y1: f32,
-    y2: f32,
-}
-
-impl BiquadFilter {
-    fn peaking(sample_rate: f64, freq_hz: f64, q: f64, gain_db: f64) -> Self {
-        let a = 10.0_f64.powf(gain_db / 40.0);
-        let w0 = 2.0 * PI * (freq_hz.min(sample_rate * 0.45)) / sample_rate;
-        let alpha = w0.sin() / (2.0 * q);
-        let cos_w0 = w0.cos();
-
-        let b0 = 1.0 + alpha * a;
-        let b1 = -2.0 * cos_w0;
-        let b2 = 1.0 - alpha * a;
-        let a0 = 1.0 + alpha / a;
-        let a1 = -2.0 * cos_w0;
-        let a2 = 1.0 - alpha / a;
-
-        Self {
-            b0: (b0 / a0) as f32,
-            b1: (b1 / a0) as f32,
-            b2: (b2 / a0) as f32,
-            a1: (a1 / a0) as f32,
-            a2: (a2 / a0) as f32,
-            x1: 0.0,
-            x2: 0.0,
-            y1: 0.0,
-            y2: 0.0,
+            buf: vec![0.0; delay + 4],
+            ptr: 0,
+            delay,
         }
     }
 
     #[inline]
-    fn process(&mut self, x: f32) -> f32 {
-        let y = self.b0 * x + self.b1 * self.x1 + self.b2 * self.x2
-            - self.a1 * self.y1
-            - self.a2 * self.y2;
-        self.x2 = self.x1;
-        self.x1 = x;
-        self.y2 = self.y1;
-        self.y1 = y;
-        y
+    fn fast_f(&mut self, sample: f32) -> f32 {
+        let len = self.buf.len();
+        let read_idx = (self.ptr + len - self.delay) % len;
+        let out = self.buf[read_idx];
+        self.buf[self.ptr] = sample;
+        self.ptr = (self.ptr + 1) % len;
+        out
     }
 }
 
-const IR_TAPS: usize = 96;
-
-/// 96-Tap FIR Impulse Response Convolver for Inconel megaphone & test-cell metallic reflections
-struct IrConvolver {
-    kernel: [f32; IR_TAPS],
-    buf: [f32; IR_TAPS],
-    ptr: usize,
+/// 4th-order Butterworth low-pass filter (ported from engine-sim's ButterworthLowPassFilter)
+#[derive(Clone, Copy)]
+struct ButterworthLP {
+    a: [f64; 5],
+    f4: f64,
+    x: [f64; 4],
+    y: [f64; 4],
 }
 
-impl IrConvolver {
-    fn new(sample_rate: f64, bank_offset: f32) -> Self {
-        let mut kernel = [0.0f32; IR_TAPS];
-        kernel[0] = 0.56;
-        let sr = sample_rate as f32;
-        let modes = [2400.0f32, 3800.0, 5600.0, 7800.0];
-        let decays = [1100.0f32, 1400.0, 1700.0, 2100.0];
+impl ButterworthLP {
+    fn new(cutoff_hz: f64, sample_rate: f64) -> Self {
+        let fc = cutoff_hz.clamp(sample_rate * 0.001, sample_rate * 0.46);
+        let f = (PI * fc / sample_rate).tan();
+        let f2 = f * f;
+        let f3 = f2 * f;
+        let f4 = f2 * f2;
+        let m = -2.0 * (5.0 * PI / 8.0).cos();
+        let n = -2.0 * (7.0 * PI / 8.0).cos();
 
-        for i in 1..IR_TAPS {
-            let t = i as f32 / sr;
-            let mut m_sum = 0.0f32;
-            for k in 0..4 {
-                let phase = 2.0 * std::f32::consts::PI * modes[k] * t + bank_offset * (k as f32 + 1.0);
-                m_sum += phase.sin() * (-decays[k] * t).exp() * 0.16;
+        let a0 = 1.0 + (m + n) * f + (2.0 + n * m) * f2 + (m + n) * f3 + f4;
+        let a = [
+            a0,
+            (-4.0 - 2.0 * (n + m) * f + 2.0 * (m + n) * f3 + 4.0 * f4) / a0,
+            (6.0 - 2.0 * (2.0 + m * n) * f2 + 6.0 * f4) / a0,
+            (-4.0 + 2.0 * (m + n) * f - 2.0 * (m + n) * f3 + 4.0 * f4) / a0,
+            (1.0 - (n + m) * f + (2.0 + m * n) * f2 - (m + n) * f3 + f4) / a0,
+        ];
+        Self {
+            a,
+            f4,
+            x: [0.0; 4],
+            y: [0.0; 4],
+        }
+    }
+
+    #[inline]
+    fn fast_f(&mut self, sample: f32) -> f32 {
+        let s = sample as f64;
+        let n = (self.f4 / self.a[0])
+            * (s + 4.0 * self.x[0] + 6.0 * self.x[1] + 4.0 * self.x[2] + self.x[3]);
+        let d = -self.a[1] * self.y[0]
+            - self.a[2] * self.y[1]
+            - self.a[3] * self.y[2]
+            - self.a[4] * self.y[3];
+        let y = n + d;
+
+        self.x[3] = self.x[2];
+        self.x[2] = self.x[1];
+        self.x[1] = self.x[0];
+        self.x[0] = s;
+
+        self.y[3] = self.y[2];
+        self.y[2] = self.y[1];
+        self.y[1] = self.y[0];
+        self.y[0] = y;
+
+        y as f32
+    }
+}
+
+/// 1st-order DC blocking low-pass filter (ported from engine-sim's LowPassFilter)
+#[derive(Clone, Copy)]
+struct LowPassFilter {
+    alpha: f32,
+    y: f32,
+}
+
+impl LowPassFilter {
+    fn new(cutoff_hz: f64, sample_rate: f64) -> Self {
+        let dt = 1.0 / sample_rate;
+        let rc = 1.0 / (cutoff_hz * 2.0 * PI);
+        let alpha = (dt / (rc + dt)) as f32;
+        Self { alpha, y: 0.0 }
+    }
+
+    #[inline]
+    fn fast_f(&mut self, sample: f32) -> f32 {
+        self.y += self.alpha * (sample - self.y);
+        self.y
+    }
+}
+
+/// Phase jitter filter (ported from engine-sim's JitterFilter)
+struct JitterFilter {
+    history: [f32; 10],
+    offset: usize,
+    jitter_scale: f32,
+    noise_lp: ButterworthLP,
+}
+
+impl JitterFilter {
+    fn new(cutoff_hz: f64, sample_rate: f64, jitter_scale: f32) -> Self {
+        Self {
+            history: [0.0; 10],
+            offset: 0,
+            jitter_scale,
+            noise_lp: ButterworthLP::new(cutoff_hz, sample_rate),
+        }
+    }
+
+    #[inline]
+    fn fast_f(&mut self, sample: f32, uniform_0_1: f32) -> f32 {
+        self.history[self.offset] = sample;
+        self.offset = (self.offset + 1) % 10;
+
+        let s = self
+            .noise_lp
+            .fast_f(uniform_0_1 * 9.0 * self.jitter_scale)
+            .clamp(0.0, 9.0);
+        let s0 = s.floor() as usize;
+        let s1 = s.ceil() as usize;
+        let frac = s - s0 as f32;
+
+        let i0 = (self.offset + s0) % 10;
+        let i1 = (self.offset + s1) % 10;
+        self.history[i0] * (1.0 - frac) + self.history[i1] * frac
+    }
+}
+
+/// Real-time FIR impulse response convolver (ported from engine-sim's ConvolutionFilter)
+struct ConvolutionFilter {
+    kernel: Vec<f32>,
+    history: Vec<f32>,
+    ptr: usize,
+    len: usize,
+}
+
+impl ConvolutionFilter {
+    fn from_wav_bytes(bytes: &[u8], target_sr: f64, volume: f32, max_taps: usize) -> Self {
+        let mut wav_sr = 44100.0_f64;
+        let mut raw_samples = Vec::<f32>::new();
+
+        if bytes.len() > 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WAVE" {
+            let mut pos = 12usize;
+            while pos + 8 <= bytes.len() {
+                let id = &bytes[pos..pos + 4];
+                let size = u32::from_le_bytes([
+                    bytes[pos + 4],
+                    bytes[pos + 5],
+                    bytes[pos + 6],
+                    bytes[pos + 7],
+                ]) as usize;
+                let data_start = pos + 8;
+                let data_end = (data_start + size).min(bytes.len());
+                if id == b"fmt " && data_end - data_start >= 16 {
+                    wav_sr = u32::from_le_bytes([
+                        bytes[data_start + 4],
+                        bytes[data_start + 5],
+                        bytes[data_start + 6],
+                        bytes[data_start + 7],
+                    ]) as f64;
+                } else if id == b"data" {
+                    for chunk in bytes[data_start..data_end].chunks_exact(2) {
+                        let s = i16::from_le_bytes([chunk[0], chunk[1]]);
+                        raw_samples.push(s as f32 / i16::MAX as f32);
+                    }
+                }
+                pos = data_start + size + (size & 1);
             }
-            kernel[i] = m_sum;
-        }
-        // Discrete early test-cell wall & floor micro-reflections (~0.45ms, ~0.95ms, ~1.55ms)
-        let r1 = ((0.00045 + bank_offset * 0.00004) * sr).round() as usize;
-        let r2 = ((0.00095 + bank_offset * 0.00006) * sr).round() as usize;
-        let r3 = ((0.00155 - bank_offset * 0.00005) * sr).round() as usize;
-        for &(idx, amp) in &[(r1, 0.24), (r2, -0.17), (r3, 0.11)] {
-            if idx > 0 && idx < IR_TAPS {
-                kernel[idx] += amp;
-            }
         }
 
-        // Normalize L1 energy slightly so IR preserves dynamic headroom
-        let abs_sum: f32 = kernel.iter().map(|v| v.abs()).sum();
-        let norm = (1.65 / abs_sum.max(1.0)).min(1.0);
-        for v in &mut kernel {
-            *v *= norm;
+        if raw_samples.is_empty() {
+            raw_samples.push(1.0);
         }
 
+        // Linearly resample IR from WAV rate (44.1 kHz) to host WASAPI rate (e.g. 48 kHz)
+        let ratio = wav_sr / target_sr.max(8000.0);
+        let resampled_len = ((raw_samples.len() as f64 / ratio).floor() as usize).clamp(1, max_taps);
+        let mut kernel = Vec::with_capacity(resampled_len);
+        for i in 0..resampled_len {
+            let src_pos = i as f64 * ratio;
+            let idx = (src_pos.floor() as usize).min(raw_samples.len() - 1);
+            let next = (idx + 1).min(raw_samples.len() - 1);
+            let frac = (src_pos - idx as f64) as f32;
+            let val = raw_samples[idx] * (1.0 - frac) + raw_samples[next] * frac;
+            kernel.push(val * volume);
+        }
+
+        let len = kernel.len();
         Self {
             kernel,
-            buf: [0.0; IR_TAPS],
+            history: vec![0.0; len * 2],
             ptr: 0,
+            len,
         }
     }
 
     #[inline]
-    fn process(&mut self, x: f32) -> f32 {
-        self.buf[self.ptr] = x;
-        let mut acc = 0.0f32;
-        let mut idx = self.ptr;
-        for k in 0..IR_TAPS {
-            acc += self.kernel[k] * self.buf[idx];
-            idx = if idx == 0 { IR_TAPS - 1 } else { idx - 1 };
+    fn fast_f(&mut self, sample: f32) -> f32 {
+        self.ptr = if self.ptr == 0 { self.len - 1 } else { self.ptr - 1 };
+        self.history[self.ptr] = sample;
+        self.history[self.ptr + self.len] = sample;
+        let h = &self.history[self.ptr..self.ptr + self.len];
+        let mut acc = 0.0_f32;
+        for (k, s) in self.kernel.iter().zip(h.iter()) {
+            acc += k * s;
         }
-        self.ptr = (self.ptr + 1) % IR_TAPS;
         acc
+    }
+}
+
+/// Auto-gain peak limiter (ported from engine-sim's LevelingFilter)
+struct LevelingFilter {
+    peak: f32,
+    attenuation: f32,
+    target: f32,
+    max_level: f32,
+    min_level: f32,
+}
+
+impl LevelingFilter {
+    fn new(target: f32, max_level: f32, min_level: f32) -> Self {
+        Self {
+            peak: target,
+            attenuation: 1.0,
+            target,
+            max_level,
+            min_level,
+        }
+    }
+
+    #[inline]
+    fn update_gain(&mut self, mag: f32) -> f32 {
+        self.peak *= 0.999;
+        if mag > self.peak {
+            self.peak = mag;
+        }
+        if self.peak <= 1e-9 {
+            return self.attenuation;
+        }
+        let raw = (self.target / self.peak).clamp(self.min_level, self.max_level);
+        self.attenuation = 0.9 * self.attenuation + 0.1 * raw;
+        self.attenuation
+    }
+}
+
+struct SynthChannel {
+    antialiasing: ButterworthLP,
+    jitter: JitterFilter,
+    dc_filter: LowPassFilter,
+    air_noise_lp: ButterworthLP,
+    convolution: ConvolutionFilter,
+    prev_in: f32,
+}
+
+impl SynthChannel {
+    fn new(sample_rate: f64) -> Self {
+        Self {
+            antialiasing: ButterworthLP::new(2600.0, sample_rate),
+            jitter: JitterFilter::new(10000.0, sample_rate, 0.15),
+            dc_filter: LowPassFilter::new(10.0, sample_rate),
+            air_noise_lp: ButterworthLP::new(2000.0, sample_rate),
+            convolution: ConvolutionFilter::from_wav_bytes(IR_WAV_BYTES, sample_rate, 0.01, 2048),
+            prev_in: 0.0,
+        }
+    }
+
+    #[inline]
+    fn process(&mut self, raw_signal: f32, sample_rate: f32, u01: f32, white_n: f32) -> f32 {
+        let aa = self.antialiasing.fast_f(raw_signal);
+        let f_in = self.jitter.fast_f(aa, u01);
+        let f_dc = self.dc_filter.fast_f(f_in);
+        let f = f_in - f_dc;
+        let f_p = (f_in - self.prev_in) * sample_rate;
+        self.prev_in = f_in;
+
+        let r = self.air_noise_lp.fast_f(white_n);
+        let df_f_mix = 0.012_f32;
+        let mut v_in = f_p * df_f_mix + f * r * (1.0 - df_f_mix);
+        if !v_in.is_finite() || v_in.is_subnormal() {
+            v_in = 0.0;
+        }
+        self.convolution.fast_f(v_in)
     }
 }
 
@@ -579,21 +843,13 @@ pub struct EngineSim {
     monza_dist_m: f64,
     monza_sector_name: &'static str,
 
-    // Audio DSP state
-    left_wg: BankWaveguide,
-    right_wg: BankWaveguide,
-    mega_l: [BiquadFilter; 3],
-    mega_r: [BiquadFilter; 3],
-    ir_l: IrConvolver,
-    ir_r: IrConvolver,
-    comb_env: f32,
-    intake_buf: [f32; 256],
-    intake_ptr: usize,
-    intake_lp: f32,
-    dc_prev_in_l: f32,
-    dc_prev_out_l: f32,
-    dc_prev_in_r: f32,
-    dc_prev_out_r: f32,
+    // Audio DSP state (engine-sim architecture)
+    collectors: [GasNode; 2],
+    delay_filters: [DelayFilter; NUM_CYL],
+    synth_ch: [SynthChannel; 2],
+    out_antialias_l: ButterworthLP,
+    out_antialias_r: ButterworthLP,
+    leveler: LevelingFilter,
     rng_state: u32,
     starter_phase: f64,
 
@@ -612,13 +868,23 @@ impl EngineSim {
             firing_offsets[cyl_idx] = (slot as f64) * (72.0_f64.to_radians());
         }
 
-        let cylinders = std::array::from_fn(|i| Cylinder::new(firing_offsets[i]));
+        let cylinders = std::array::from_fn(|i| Cylinder::new(i, firing_offsets[i]));
         let mut dyno_curve = [DynoPoint::default(); DYNO_BINS];
         for (i, pt) in dyno_curve.iter_mut().enumerate() {
             pt.rpm = (DYNO_MIN_RPM + i * DYNO_STEP_RPM) as f32;
         }
 
         let sr_safe = sample_rate.max(22050.0);
+        let delay_filters = std::array::from_fn(|i| {
+            let bank = i / 5;
+            let ex_len = PRIMARY_BASE_LEN_M + PRIMARY_OFFSETS_M[i] + BANK_COLLECTOR_LEN_M[bank];
+            DelayFilter::new(ex_len / 343.0, sr_safe)
+        });
+        let col_area = 0.0052;
+        let collectors = [
+            GasNode::new(col_area * BANK_COLLECTOR_LEN_M[0], col_area),
+            GasNode::new(col_area * BANK_COLLECTOR_LEN_M[1], col_area),
+        ];
         let mut sim = Self {
             sample_rate: sr_safe,
             cylinders,
@@ -658,28 +924,12 @@ impl EngineSim {
             monza_dist_m: 0.0,
             monza_sector_name: "Pit Lane",
 
-            left_wg: BankWaveguide::new(sr_safe),
-            right_wg: BankWaveguide::new(sr_safe),
-            mega_l: [
-                BiquadFilter::peaking(sr_safe, 720.0, 1.8, 5.5),
-                BiquadFilter::peaking(sr_safe, 2150.0, 2.8, 8.5),
-                BiquadFilter::peaking(sr_safe, 4100.0, 3.2, 9.5),
-            ],
-            mega_r: [
-                BiquadFilter::peaking(sr_safe, 720.0, 1.8, 5.5),
-                BiquadFilter::peaking(sr_safe, 2150.0, 2.8, 8.5),
-                BiquadFilter::peaking(sr_safe, 4100.0, 3.2, 9.5),
-            ],
-            ir_l: IrConvolver::new(sr_safe, 0.0),
-            ir_r: IrConvolver::new(sr_safe, 0.42),
-            comb_env: 0.0,
-            intake_buf: [0.0; 256],
-            intake_ptr: 0,
-            intake_lp: 0.0,
-            dc_prev_in_l: 0.0,
-            dc_prev_out_l: 0.0,
-            dc_prev_in_r: 0.0,
-            dc_prev_out_r: 0.0,
+            collectors,
+            delay_filters,
+            synth_ch: [SynthChannel::new(sr_safe), SynthChannel::new(sr_safe)],
+            out_antialias_l: ButterworthLP::new(sr_safe * 0.45, sr_safe),
+            out_antialias_r: ButterworthLP::new(sr_safe * 0.45, sr_safe),
+            leveler: LevelingFilter::new(26000.0, 1.9, 1.0e-6),
             rng_state: 0x1357_2468,
             starter_phase: 0.0,
 
@@ -735,10 +985,15 @@ impl EngineSim {
         self.monza_dist_m = 0.0;
         self.dyno_sweep_running = false;
         self.plenum_pressure_pa = P_ATM;
-        self.comb_env = 0.0;
 
-        for c in &mut self.cylinders {
-            *c = Cylinder::new(c.firing_offset_rad);
+        let col_area = 0.0052;
+        self.collectors = [
+            GasNode::new(col_area * BANK_COLLECTOR_LEN_M[0], col_area),
+            GasNode::new(col_area * BANK_COLLECTOR_LEN_M[1], col_area),
+        ];
+
+        for (i, c) in self.cylinders.iter_mut().enumerate() {
+            *c = Cylinder::new(i, c.firing_offset_rad);
         }
         self.sync_cylinders_kinematics();
     }
@@ -791,99 +1046,47 @@ impl EngineSim {
         const SUBSTEPS: usize = 2;
         let dt = 1.0 / (self.sample_rate * SUBSTEPS as f64);
 
-        let mut left_drive = [0.0f32; 5];
-        let mut right_drive = [0.0f32; 5];
-        let mut intake_drive = 0.0f32;
-
         for _ in 0..SUBSTEPS {
             self.step_physics_substep(dt, ctrl);
-            for i in 0..5 {
-                left_drive[i] += self.cylinders[i].ex_flow_pulse as f32 * 0.5;
-                right_drive[i] += self.cylinders[i + 5].ex_flow_pulse as f32 * 0.5;
-            }
-            for c in &self.cylinders {
-                intake_drive += c.in_flow_pulse as f32 * 1.1;
-            }
         }
 
-        // Inject jet shear turbulence proportional to exhaust mass flow
-        for i in 0..5 {
-            let jet_l = self.fast_noise() * left_drive[i].abs() * 0.28;
-            let jet_r = self.fast_noise() * right_drive[i].abs() * 0.28;
-            left_drive[i] += jet_l;
-            right_drive[i] += jet_r;
+        // Write gas-dynamic exhaust pulses into the 2 synthesizer channels (engine-sim writeToSynthesizer)
+        let attenuation = (self.omega_rad_s.abs() / 40.0).clamp(0.0, 1.0);
+        let attenuation_3 = attenuation * attenuation * attenuation;
+
+        let mut staging = [0.0_f32; 2];
+        for i in 0..NUM_CYL {
+            let bank = i / 5;
+            let ex_len = PRIMARY_BASE_LEN_M + PRIMARY_OFFSETS_M[i] + BANK_COLLECTOR_LEN_M[bank];
+            let runner = &self.cylinders[i].runner_gas;
+            let exhaust_flow = attenuation_3
+                * 1600.0
+                * ((runner.pressure_pa() - P_ATM)
+                    + 0.1 * runner.dynamic_pressure(1.0)
+                    + 0.1 * runner.dynamic_pressure(-1.0));
+            let delayed = self.delay_filters[i].fast_f(exhaust_flow as f32);
+            staging[bank] += SOUND_ATTENUATION[i]
+                * (0.008 * delayed / NUM_CYL as f32)
+                / (ex_len * ex_len) as f32;
         }
 
-        // 1. Nonlinear 5-into-1 Shock-Steepening Waveguides
-        let pop_n_l = self.fast_noise();
-        let pop_n_r = self.fast_noise();
-        let wg_l = self.left_wg.step(left_drive, pop_n_l);
-        let wg_r = self.right_wg.step(right_drive, pop_n_r);
+        let sr_f32 = self.sample_rate as f32;
+        let u0 = 0.5 + 0.5 * self.fast_noise();
+        let w0 = self.fast_noise();
+        let u1 = 0.5 + 0.5 * self.fast_noise();
+        let w1 = self.fast_noise();
 
-        // 2. Phase-Locked 72-deg V10 Harmonic & Megaphone Formant Exciter
-        let rpm = (self.omega_rad_s * 60.0 / (2.0 * PI)).max(0.0);
-        let rpm_norm = (rpm / 19_000.0).clamp(0.0, 1.15) as f32;
-        let firing_ok = ctrl.ignition_on
-            && ctrl.fuel_pump_on
-            && self.rev_cut_timer <= 0.0
-            && self.shift_cut_timer <= 0.0
-            && !self.valve_float_active
-            && rpm > 700.0;
-        let comb_target = if firing_ok {
-            (0.22 + 0.78 * self.effective_throttle as f32) * (0.25 + 0.75 * rpm_norm.sqrt())
-        } else if rpm > 900.0 {
-            // Pumping overrun groan without combustion fire
-            0.08 * rpm_norm
-        } else {
-            0.0
-        };
-        let env_rate = if comb_target > self.comb_env { 0.035 } else { 0.018 };
-        self.comb_env += env_rate * (comb_target - self.comb_env);
+        let v0 = self.synth_ch[0].process(staging[0], sr_f32, u0, w0);
+        let v1 = self.synth_ch[1].process(staging[1], sr_f32, u1, w1);
 
-        let ca = self.crank_angle_rad;
-        let shape = |mult: f64| -> f32 {
-            let s1 = (ca * mult).sin();
-            let s2 = (ca * mult * 2.0).sin();
-            ((s1 + 0.35 * s2) * 1.15).tanh() as f32
-        };
-        // High-RPM blossom weights: 2.5x/5x bark -> 7.5x/10x/15x metallic F1 scream
-        let hi_blossom = ((rpm_norm - 0.35) / 0.65).clamp(0.0, 1.0);
-        let scream_blossom = ((rpm_norm - 0.55) / 0.45).clamp(0.0, 1.0);
+        let aa_l = self.out_antialias_l.fast_f(v0 * 0.72 + v1 * 0.28);
+        let aa_r = self.out_antialias_r.fast_f(v1 * 0.72 + v0 * 0.28);
 
-        let bank_2_5 = shape(2.5) * 0.42;
-        let bank_7_5 = shape(7.5) * (0.18 + 0.36 * hi_blossom);
-        let bank_12_5 = shape(12.5) * (0.05 + 0.28 * scream_blossom);
-
-        let sum_5_0 = shape(5.0) * (0.38 + 0.25 * hi_blossom);
-        let sum_10_0 = shape(10.0) * (0.14 + 0.34 * hi_blossom);
-        let sum_15_0 = shape(15.0) * (0.04 + 0.28 * scream_blossom);
-        let sum_20_0 = shape(20.0) * (0.18 * scream_blossom);
-
-        let shared_orders = sum_5_0 + sum_10_0 + sum_15_0 + sum_20_0;
-        let exc_l = (shared_orders + bank_2_5 + bank_7_5 + bank_12_5) * self.comb_env * 0.26;
-        let exc_r = (shared_orders - bank_2_5 - bank_7_5 - bank_12_5) * self.comb_env * 0.26;
-
-        // 3. Variable intake trumpet waveguide resonator
-        let total_intake_len = 0.085 + self.trumpet_length_m;
-        let intake_delay = (((2.0 * total_intake_len / 346.0) * self.sample_rate).round() as usize)
-            .clamp(8, 240);
-        let ip = self.intake_ptr;
-        let i_read = (ip + 256 - intake_delay) & 255;
-        let i_del = self.intake_buf[i_read];
-        let i_wave = (intake_drive * 0.72 - 0.58 * i_del).clamp(-4.0, 4.0);
-        self.intake_buf[ip] = i_wave;
-        self.intake_ptr = (ip + 1) & 255;
-        self.intake_lp += 0.35 * (i_wave - self.intake_lp);
-        let intake_snd = ((i_wave - self.intake_lp) * 0.7 + self.intake_lp * 0.3)
-            * (0.15 + 0.85 * self.effective_throttle as f32);
-
-        // Straight-cut camshaft gear & pneumatic valvetrain mechanical whine
-        let mech_amp = rpm_norm * 0.025;
-        let gear_whine = (((ca * 11.0).sin() * 0.5 + (ca * 22.0).sin() * 0.35 + (ca * 5.0).sin() * 0.25)
-            as f32)
-            * mech_amp;
+        let level_gain = self.leveler.update_gain(aa_l.abs().max(aa_r.abs()));
+        let norm_scale = (level_gain / 32768.0) * if ctrl.muted { 0.0 } else { ctrl.master_volume };
 
         // External pneumatic starter gun turbine sound
+        let rpm = (self.omega_rad_s * 60.0 / (2.0 * PI)).max(0.0);
         let starter_snd = if ctrl.starter_active {
             let st_freq = 440.0 + rpm * 0.35;
             self.starter_phase = (self.starter_phase + 2.0 * PI * st_freq / self.sample_rate) % (2.0 * PI);
@@ -893,40 +1096,16 @@ impl EngineSim {
             0.0
         };
 
-        // Combine Waveguides + Phase-Locked V10 Exciter -> 3-Band Megaphone Resonator -> 96-Tap IR
-        let ex_l = wg_l * 0.55 + exc_l;
-        let ex_r = wg_r * 0.55 + exc_r;
+        let out_l = (aa_l * norm_scale + starter_snd).tanh();
+        let out_r = (aa_r * norm_scale + starter_snd).tanh();
 
-        let mut mega_out_l = ex_l * 0.65 + ex_r * 0.18 + intake_snd * 0.22;
-        let mut mega_out_r = ex_r * 0.65 + ex_l * 0.18 + intake_snd * 0.22;
-        for b in 0..3 {
-            mega_out_l = self.mega_l[b].process(mega_out_l);
-            mega_out_r = self.mega_r[b].process(mega_out_r);
-        }
-
-        // 4. 96-Tap Metallic Megaphone & Test-Cell Early Reflection IR Convolver
-        let conv_l = self.ir_l.process(mega_out_l) + gear_whine + starter_snd;
-        let conv_r = self.ir_r.process(mega_out_r) + gear_whine + starter_snd;
-
-        // 20 Hz DC blocking filter (no aggressive upper-band lowpass!)
-        let dc_l = conv_l - self.dc_prev_in_l + 0.996 * self.dc_prev_out_l;
-        self.dc_prev_in_l = conv_l;
-        self.dc_prev_out_l = dc_l;
-
-        let dc_r = conv_r - self.dc_prev_in_r + 0.996 * self.dc_prev_out_r;
-        self.dc_prev_in_r = conv_r;
-        self.dc_prev_out_r = dc_r;
-
-        let gain = if ctrl.muted { 0.0 } else { ctrl.master_volume * 0.55 };
-        let out_l = (dc_l * gain).tanh();
-        let out_r = (dc_r * gain).tanh();
-
-        // Update oscilloscope trace (decimated 2:1 so waveform displays ~10ms window cleanly)
+        // Update oscilloscope trace (decimated 2:1)
         self.scope_decim = (self.scope_decim + 1) & 1;
         if self.scope_decim == 0 {
             let sp = self.scope_ptr;
-            self.scope_left[sp] = ex_l.clamp(-1.0, 1.0);
-            self.scope_right[sp] = ex_r.clamp(-1.0, 1.0);
+            let disp_scale = level_gain / 32768.0;
+            self.scope_left[sp] = (v0 * disp_scale).clamp(-1.0, 1.0);
+            self.scope_right[sp] = (v1 * disp_scale).clamp(-1.0, 1.0);
             self.scope_audio[sp] = 0.5 * (out_l + out_r);
             self.scope_ptr = (sp + 1) % SCOPE_LEN;
         }
@@ -1080,18 +1259,15 @@ impl EngineSim {
         let mut total_gas_torque = 0.0;
         let mut sum_intake_mass = 0.0;
         let mut heat_to_coolant = 0.0;
-        let mut pop_trigger_l = false;
-        let mut pop_trigger_r = false;
 
         // Spark advance (deg BTDC): ramps from 14 deg at idle up to 28 deg MBT at 19k RPM + ECU offset
         let base_adv_deg = 14.0 + 14.0 * ((rpm - 4000.0) / 15000.0).clamp(0.0, 1.0);
         let spark_adv_deg = (base_adv_deg + ctrl.spark_offset_deg).clamp(2.0, 48.0);
         let spark_angle_rad = (720.0 - spark_adv_deg).to_radians();
 
-        let p_ex_manifold = P_ATM + 3500.0 * (rpm / 19000.0).powi(2);
-        let t_ex_manifold = (self.egt_c + 273.15).max(300.0);
-
         for idx in 0..NUM_CYL {
+            let rand_burn = 1.0 + 0.06 * (self.fast_noise() as f64);
+            let bank = idx / 5;
             let cyl = &mut self.cylinders[idx];
             let theta = wrap_720(self.crank_angle_rad - cyl.firing_offset_rad);
             let prev_theta = cyl.prev_local_angle;
@@ -1105,8 +1281,6 @@ impl EngineSim {
             // Valve lifts (0..1)
             let in_lift = (intake_lift_norm(theta) + valve_float_fraction).min(1.0);
             let ex_lift = (exhaust_lift_norm(theta) + valve_float_fraction).min(1.0);
-            let d_ex_lift = (ex_lift - cyl.prev_ex_lift).max(0.0);
-            cyl.prev_ex_lift = ex_lift;
             cyl.intake_lift = in_lift;
             cyl.exhaust_lift = ex_lift;
 
@@ -1116,6 +1290,8 @@ impl EngineSim {
 
             // Dynamic intake port pressure boosted by variable trumpet Helmholtz wave near IVC
             let p_port_in = self.plenum_pressure_pa * ram_boost;
+            let p_runner = cyl.runner_gas.pressure_pa();
+            let t_runner = cyl.runner_gas.temp_k();
 
             let mut dm_in = if a_in > 1e-7 {
                 orifice_mass_flow(p_port_in, T_ATM + 12.0, cyl.pressure_pa, cyl.temp_k, a_in) * dt
@@ -1123,7 +1299,7 @@ impl EngineSim {
                 0.0
             };
             let mut dm_ex = if a_ex > 1e-7 {
-                orifice_mass_flow(cyl.pressure_pa, cyl.temp_k, p_ex_manifold, t_ex_manifold, a_ex) * dt
+                orifice_mass_flow(cyl.pressure_pa, cyl.temp_k, p_runner, t_runner, a_ex) * dt
             } else {
                 0.0
             };
@@ -1145,12 +1321,11 @@ impl EngineSim {
                 let keep = (1.0 - dm_ex / m_old_track).clamp(0.0, 1.0);
                 cyl.fresh_air_mass *= keep;
             }
-            // Note: negative dm_ex (exhaust reversion during overlap) adds inert exhaust to air_mass, NOT fresh_air_mass!
             cyl.fresh_air_mass = cyl.fresh_air_mass.min(m_old_track + dm_in.max(0.0));
 
             dm_plenum_out += dm_in / dt;
 
-            // Fuel injection during intake stroke (400..540 deg)
+            // Fuel injection during intake stroke
             if dm_in > 0.0 && ctrl.fuel_pump_on {
                 let target_afr = AFR_STOICH * ctrl.lambda_target.clamp(0.72, 1.25);
                 cyl.fuel_mass += dm_in / target_afr;
@@ -1169,7 +1344,6 @@ impl EngineSim {
                     cyl.spark_timer = 0.0025;
                     cyl.spark_cut_this_cycle = false;
 
-                    // Oxygen-limited chemical energy based strictly on FRESH trapped air (exhaust dilution doesn't burn!)
                     let max_burn_fuel = cyl.fresh_air_mass / AFR_STOICH;
                     let burn_fuel = cyl.fuel_mass.min(max_burn_fuel * 1.04);
                     let rich_bonus = if ctrl.lambda_target < 1.0 {
@@ -1177,12 +1351,12 @@ impl EngineSim {
                     } else {
                         1.0 - 0.35 * (ctrl.lambda_target - 1.0)
                     };
-                    cyl.comb_energy_total = (burn_fuel * Q_LHV_FUEL * 0.85 * rich_bonus).max(0.0);
+                    cyl.comb_energy_total =
+                        (burn_fuel * Q_LHV_FUEL * 0.85 * rich_bonus * rand_burn).max(0.0);
                     cyl.fuel_mass = (cyl.fuel_mass - burn_fuel).max(0.0);
                     cyl.fresh_air_mass = (cyl.fresh_air_mass - burn_fuel * AFR_STOICH).max(0.0);
                     cyl.unburnt_fuel = 0.0;
 
-                    // Detonation / Knock condition: excessive spark advance, lean WOT, or overheating
                     let high_load = self.plenum_pressure_pa > 78_000.0;
                     let knock_risk = (ctrl.spark_offset_deg > 7.5 && high_load)
                         || (ctrl.lambda_target > 1.08 && high_load)
@@ -1194,7 +1368,6 @@ impl EngineSim {
                         self.bore_health = (self.bore_health - 0.003).max(0.05);
                     }
                 } else {
-                    // Ignition cut or unlit mixture sends unburnt fuel into hot headers -> crackle pops!
                     cyl.unburnt_fuel = cyl.fuel_mass;
                     cyl.fuel_mass = 0.0;
                     cyl.spark_cut_this_cycle = true;
@@ -1204,7 +1377,7 @@ impl EngineSim {
             // Wiebe heat release (~66 deg burn duration -> MFB50 around ~7 deg ATDC)
             let mut dq_comb = 0.0;
             if cyl.combusting {
-                let burn_dur = 1.15; // ~66 deg crank angle
+                let burn_dur = 1.15;
                 let elapsed = wrap_720(theta - cyl.comb_start_rad);
                 if elapsed < burn_dur {
                     let frac = (elapsed / burn_dur).clamp(0.0, 1.0);
@@ -1220,14 +1393,13 @@ impl EngineSim {
                 }
             }
 
-            // 1st-Law Energy Balance: dU = dQ_comb - dQ_wall - P*dV + h_in*dm_in - h_out*dm_ex
+            // 1st-Law Energy Balance
             let m_old = cyl.air_mass.max(1e-6);
             let m_new = (m_old + dm_in - dm_ex).max(1e-6);
 
             let h_in_spec = GAMMA_AIR * CV_GAS * (if dm_in >= 0.0 { T_ATM + 12.0 } else { cyl.temp_k });
-            let h_ex_spec = GAMMA_AIR * CV_GAS * (if dm_ex >= 0.0 { cyl.temp_k } else { t_ex_manifold });
+            let h_ex_spec = GAMMA_AIR * CV_GAS * (if dm_ex >= 0.0 { cyl.temp_k } else { t_runner });
 
-            // Wall heat transfer (Woschni-like)
             let area_wall = 2.0 * PISTON_AREA_M2 + PI * BORE_M * x;
             let h_conv = 120.0 + 11.0 * (rpm / 1000.0);
             let t_wall = self.coolant_temp_c + 273.15 + 75.0;
@@ -1242,25 +1414,17 @@ impl EngineSim {
             cyl.temp_k = (u_new / (m_new * CV_GAS)).clamp(240.0, 3400.0);
             cyl.pressure_pa = (m_new * R_AIR * cyl.temp_k / vol).clamp(12_000.0, 1.4e7);
 
-            // Exhaust valve opening Friedlander blowdown shock + mass-flow pulse
-            let p_cyl_bar = (cyl.pressure_pa * 1e-5).max(1.0);
-            let shock = d_ex_lift * (p_cyl_bar - 1.0).max(0.0) * 18.0;
-            if dm_ex > 0.0 {
-                let p_ratio = ((cyl.pressure_pa - p_ex_manifold) / 100_000.0).max(0.0);
-                cyl.ex_flow_pulse =
-                    ((dm_ex / dt) * (1.0 + 0.65 * p_ratio.sqrt()) + shock) * CYL_TRIM[idx];
-                if cyl.unburnt_fuel > 1e-6 && self.egt_c > 350.0 && theta > 2.2 {
-                    cyl.unburnt_fuel = 0.0;
-                    if idx < 5 {
-                        pop_trigger_l = true;
-                    } else {
-                        pop_trigger_r = true;
-                    }
-                }
-            } else {
-                cyl.ex_flow_pulse = ((dm_ex / dt) * 0.25 + shock * 0.5) * CYL_TRIM[idx];
+            // Gas-dynamic runner & collector flow (ported from engine-sim CombustionChamber + ExhaustSystem)
+            cyl.runner_gas.add_flow_from_cylinder(dm_ex, cyl.temp_k, dt);
+            if dm_ex > 0.0 && cyl.unburnt_fuel > 1e-6 && self.egt_c > 350.0 && theta > 2.2 {
+                // Overrun / ignition-cut thermal pop inside hot primary header
+                cyl.runner_gas.e_internal += cyl.unburnt_fuel * Q_LHV_FUEL * 0.12;
+                cyl.unburnt_fuel = 0.0;
             }
-            cyl.in_flow_pulse = dm_in / dt;
+            cyl.runner_gas.dissipate_excess_velocity();
+            cyl.runner_gas.flow_to_node(&mut self.collectors[bank], dt, 0.00185);
+            cyl.runner_gas.dissipate_excess_velocity();
+            cyl.runner_gas.update_velocity(dt, 0.75);
 
             if cyl.spark_timer > 0.0 {
                 cyl.spark_timer = (cyl.spark_timer - dt).max(0.0);
@@ -1269,22 +1433,20 @@ impl EngineSim {
                 cyl.knock_timer = (cyl.knock_timer - dt).max(0.0);
             }
 
-            // Virtual-work crank gas torque
             total_gas_torque += (cyl.pressure_pa - P_ATM) * PISTON_AREA_M2 * dx_dtheta;
             sum_intake_mass += cyl.last_intake_mass;
 
-            // Update Cylinder 1 P-V Diagram bucket
             if idx == 0 {
                 let pv_idx = (((theta / FOUR_PI) * PV_POINTS as f64) as usize).min(PV_POINTS - 1);
                 self.pv_trace[pv_idx] = ((vol * 1e6) as f32, (cyl.pressure_pa * 1e-5) as f32);
             }
         }
 
-        if pop_trigger_l {
-            self.left_wg.pop_env = (self.left_wg.pop_env + 0.85).min(1.8);
-        }
-        if pop_trigger_r {
-            self.right_wg.pop_env = (self.right_wg.pop_env + 0.85).min(1.8);
+        for col in &mut self.collectors {
+            col.dissipate_excess_velocity();
+            col.flow_to_atmosphere(dt, 0.0052);
+            col.dissipate_excess_velocity();
+            col.update_velocity(dt, 0.85);
         }
 
         // Update Plenum pressure (allow true high-vacuum down to 0.05 bar on idle/overrun)
