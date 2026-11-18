@@ -98,6 +98,24 @@ impl FormulaApp {
             return;
         }
         self.visuals_applied = true;
+
+        // Replace default programmer font with DIN 1451 (Bahnschrift) / Segoe UI motorsport typeface
+        if let Ok(bytes) = std::fs::read(r"C:\Windows\Fonts\bahnschrift.ttf")
+            .or_else(|_| std::fs::read(r"C:\Windows\Fonts\segoeui.ttf"))
+        {
+            let mut fonts = egui::FontDefinitions::default();
+            fonts
+                .font_data
+                .insert("din".to_owned(), egui::FontData::from_owned(bytes));
+            if let Some(fam) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+                fam.insert(0, "din".to_owned());
+            }
+            if let Some(fam) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
+                fam.insert(0, "din".to_owned());
+            }
+            ctx.set_fonts(fonts);
+        }
+
         let mut style = (*ctx.style()).clone();
         style.visuals.window_fill = BG_CANVAS;
         style.visuals.panel_fill = BG_CANVAS;
@@ -155,6 +173,13 @@ impl FormulaApp {
                 self.cam_yaw = -0.62;
                 self.cam_pitch = 0.34;
                 self.cam_zoom = 1.0;
+            }
+            if i.key_pressed(egui::Key::Escape) {
+                ctrl.reset_repair_trigger = true;
+                self.cam_yaw = -0.62;
+                self.cam_pitch = 0.34;
+                self.cam_zoom = 1.0;
+                self.menu_open = false;
             }
         });
     }
@@ -216,13 +241,13 @@ impl eframe::App for FormulaApp {
                 );
                 let popover_rect = Rect::from_min_size(
                     Pos2::new(full_rect.left() + 26.0, hamburger_btn_rect.top() - 252.0),
-                    Vec2::new(224.0, 244.0),
+                    Vec2::new(242.0, 244.0),
                 );
 
-                let right_w = 312.0_f32;
+                let right_w = 332.0_f32;
                 let right_hud_rect = Rect::from_min_max(
-                    Pos2::new(full_rect.right() - right_w - 18.0, full_rect.top() + 80.0),
-                    Pos2::new(full_rect.right() - 18.0, full_rect.bottom() - 22.0),
+                    Pos2::new(full_rect.right() - right_w - 18.0, full_rect.top() + 74.0),
+                    Pos2::new(full_rect.right() - 18.0, full_rect.bottom() - 20.0),
                 );
 
                 let pointer_pos = ctx.input(|i| i.pointer.interact_pos());
@@ -1406,8 +1431,8 @@ fn draw_top_hud(
         ("SPEED", format!("{:3.0} km/h", snap.speed_kmh), TEXT_PRIMARY, center_x + 175.0),
     ];
     for (lbl, val, c, x) in &cols {
-        p.text(Pos2::new(*x, led_y + 13.0), Align2::CENTER_TOP, *lbl, FontId::monospace(9.0), TEXT_MUTED);
-        p.text(Pos2::new(*x, led_y + 25.0), Align2::CENTER_TOP, val, FontId::monospace(15.0), *c);
+        p.text(Pos2::new(*x, led_y + 13.0), Align2::CENTER_TOP, *lbl, FontId::proportional(10.0), TEXT_MUTED);
+        p.text(Pos2::new(*x, led_y + 25.0), Align2::CENTER_TOP, val, FontId::proportional(17.5), *c);
     }
 
     // Subtle status badge top-right
@@ -1433,7 +1458,7 @@ fn draw_top_hud(
         Pos2::new(full_rect.right() - 22.0, full_rect.top() + 22.0),
         Align2::RIGHT_TOP,
         st_txt,
-        FontId::monospace(11.5),
+        FontId::proportional(12.5),
         st_col,
     );
 
@@ -1442,7 +1467,7 @@ fn draw_top_hud(
         Pos2::new(full_rect.left() + 26.0, full_rect.top() + 20.0),
         Align2::LEFT_TOP,
         "F1 3.0L V10",
-        FontId::monospace(13.0),
+        FontId::proportional(15.0),
         TEXT_PRIMARY,
     );
 }
@@ -1460,7 +1485,7 @@ fn draw_vertical_throttle_slider(
         Pos2::new(bar_rect.left(), bar_rect.top() - 16.0),
         Align2::LEFT_BOTTOM,
         format!("THROTTLE {:3.0}%", ctrl.throttle * 100.0),
-        FontId::monospace(10.5),
+        FontId::proportional(11.5),
         TEXT_PRIMARY,
     );
 
@@ -1509,10 +1534,10 @@ fn draw_vertical_throttle_slider(
 
     let marks = [
         (1.00_f32, "100%  [SPACE]", ACCENT_GREEN),
-        (0.75_f32, " 75%  [W / ↑]", TEXT_MUTED),
-        (0.50_f32, " 50%", TEXT_MUTED),
-        (0.25_f32, " 25%  [S / ↓]", TEXT_MUTED),
-        (0.00_f32, "  0%  Idle", TEXT_MUTED),
+        (0.75_f32, "75%   [W / ↑]", TEXT_MUTED),
+        (0.50_f32, "50%", TEXT_MUTED),
+        (0.25_f32, "25%   [S / ↓]", TEXT_MUTED),
+        (0.00_f32, "0%    Idle", TEXT_MUTED),
     ];
     for &(frac, label, col) in &marks {
         let ty = bar_rect.bottom() - frac * bar_rect.height();
@@ -1524,7 +1549,7 @@ fn draw_vertical_throttle_slider(
             Pos2::new(bar_rect.right() + 13.0, ty),
             Align2::LEFT_CENTER,
             label,
-            FontId::monospace(9.5),
+            FontId::proportional(10.5),
             col,
         );
     }
@@ -1532,9 +1557,9 @@ fn draw_vertical_throttle_slider(
     p.text(
         Pos2::new(bar_rect.left(), bar_rect.bottom() + 18.0),
         Align2::LEFT_TOP,
-        "[Z/X] Shift  •  [Q] Auto",
-        FontId::monospace(9.5),
-        Color32::from_rgb(92, 100, 115),
+        "[Z/X] Shift  •  [Q] Auto  •  [ESC] Reset",
+        FontId::proportional(10.5),
+        Color32::from_rgb(102, 110, 125),
     );
 }
 
@@ -1551,7 +1576,6 @@ fn draw_bottom_hamburger_menu(
     cam_pitch: &mut f32,
     cam_zoom: &mut f32,
 ) {
-    // Hamburger toggle button + current active mode badge
     let resp = ui.interact(btn_rect, ui.id().with("hamburger_btn"), Sense::click());
     if resp.clicked() {
         *menu_open = !*menu_open;
@@ -1564,7 +1588,6 @@ fn draw_bottom_hamburger_menu(
     p.rect_filled(btn_rect, 4.0, fill);
     p.rect_stroke(btn_rect, 4.0, Stroke::new(1.0_f32, BORDER_SUBTLE));
 
-    // Draw crisp 3-bar hamburger icon
     let icon_x0 = btn_rect.left() + 11.0;
     let icon_x1 = btn_rect.left() + 25.0;
     let cy = btn_rect.center().y;
@@ -1592,7 +1615,7 @@ fn draw_bottom_hamburger_menu(
         Pos2::new(icon_x1 + 10.0, cy),
         Align2::LEFT_CENTER,
         mode_text,
-        FontId::monospace(10.0),
+        FontId::proportional(11.0),
         ACCENT_CYAN,
     );
 
@@ -1600,14 +1623,13 @@ fn draw_bottom_hamburger_menu(
         return;
     }
 
-    // Floating Popover Menu directly above the bottom hamburger button
     p.rect_filled(popover_rect, 5.0, bg_popover());
     p.rect_stroke(popover_rect, 5.0, Stroke::new(1.0_f32, Color32::from_rgb(44, 52, 66)));
 
     ui.allocate_new_ui(
         egui::UiBuilder::new().max_rect(popover_rect.shrink(10.0)),
         |ui| {
-            ui.label(RichText::new("DRIVE / TEST MODE").monospace().size(9.5).color(TEXT_MUTED));
+            ui.label(RichText::new("DRIVE / TEST MODE").size(10.0).color(TEXT_MUTED));
             let mode_items = [
                 (BenchMode::FreeRev, "Manual Rev"),
                 (BenchMode::DynoSweep, "Auto Pull (5.5k–19.5k)"),
@@ -1617,7 +1639,7 @@ fn draw_bottom_hamburger_menu(
             for &(m, label) in &mode_items {
                 let sel = ctrl.bench_mode == m;
                 if ui
-                    .add_sized([202.0, 22.0], egui::SelectableLabel::new(sel, label))
+                    .add_sized([220.0, 22.0], egui::SelectableLabel::new(sel, label))
                     .clicked()
                 {
                     ctrl.bench_mode = m;
@@ -1637,8 +1659,11 @@ fn draw_bottom_hamburger_menu(
                     ctrl.quick_start_trigger = true;
                     *menu_open = false;
                 }
-                if ui.small_button("Reset").clicked() {
+                if ui.small_button("Reset [ESC]").clicked() {
                     ctrl.reset_repair_trigger = true;
+                    *cam_yaw = -0.62;
+                    *cam_pitch = 0.34;
+                    *cam_zoom = 1.0;
                     *menu_open = false;
                 }
                 if ui.small_button("View [R]").clicked() {
@@ -1686,14 +1711,14 @@ fn draw_footer_prompt(
         };
         (m.to_string(), TEXT_PRIMARY)
     } else if snap.cold_seized {
-        ("COLD SEIZED (<60C) — Click the 3D Block Pre-Heaters to warm fluids first".to_string(), ACCENT_RED)
+        ("COLD SEIZED (<60°C) — Click the 3D Block Pre-Heaters to warm fluids first".to_string(), ACCENT_RED)
     } else if !warm_ok && !ctrl.preheat_on() {
         (
-            format!("STEP 1/4: Click the 3D Lower Block Manifolds to Pre-Heat ({:.0}C -> 60C)  •  or [Q] Auto Start", min_temp),
+            format!("STEP 1/4: Click the 3D Lower Block Manifolds to Pre-Heat ({:.0}°C -> 60°C)  •  or [Q] Auto Start", min_temp),
             ACCENT_AMBER,
         )
     } else if !warm_ok {
-        (format!("Warming block & oil... ({:.0}C / 60C)", min_temp), ACCENT_AMBER)
+        (format!("Warming block & oil... ({:.0}°C / 60°C)", min_temp), ACCENT_AMBER)
     } else if !pneu_ok {
         ("STEP 2/4: Click the 3D N2 Cylinder (right flank) or Cam Covers to pressurize (165 bar)".to_string(), ACCENT_AMBER)
     } else if !armed_ok {
@@ -1701,10 +1726,10 @@ fn draw_footer_prompt(
     } else if !snap.is_running {
         ("STEP 4/4: Click & Hold the 3D Rear Air Starter to fire up the V10".to_string(), ACCENT_GREEN)
     } else {
-        ("MMB Drag: Orbit 3D Engine  •  Scroll: Zoom  •  [R] Reset View".to_string(), TEXT_MUTED)
+        ("MMB Drag: Orbit 3D Engine  •  Scroll: Zoom  •  [ESC] Reset  •  [R] Reset View".to_string(), TEXT_MUTED)
     };
 
-    p.text(Pos2::new(center_x, y), Align2::CENTER_BOTTOM, msg, FontId::monospace(10.0), col);
+    p.text(Pos2::new(center_x, y), Align2::CENTER_BOTTOM, msg, FontId::proportional(11.0), col);
 }
 
 fn draw_right_hud(
@@ -1715,84 +1740,124 @@ fn draw_right_hud(
     diag_plot: &mut DiagnosticPlot,
 ) {
     ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
-        // Card 1: Clean Dyno Power & Torque Graph
         draw_dyno_card(ui, snap, ctrl);
-
         ui.add_space(10.0);
-
-        // Card 2: Switchable P-V Loop / Exhaust Acoustic Waveform
         draw_diag_card(ui, snap, diag_plot);
-
         ui.add_space(10.0);
-
-        // Compact 4-Cell Vitals Strip
         draw_vitals_strip(ui, snap, ctrl);
     });
 }
 
+#[inline]
+fn catmull_rom_scalar(p0: f32, p1: f32, p2: f32, p3: f32, t: f32) -> f32 {
+    let t2 = t * t;
+    let t3 = t2 * t;
+    0.5 * ((2.0 * p1)
+        + (-p0 + p2) * t
+        + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+        + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3)
+}
+
 fn draw_dyno_card(ui: &mut egui::Ui, snap: &TelemetrySnapshot, ctrl: &mut SharedControls) {
-    let card_h = 198.0_f32;
-    let card_w = ui.available_width().max(260.0);
+    let card_h = 232.0_f32;
+    let card_w = ui.available_width().max(290.0);
     let (card_rect, _) = ui.allocate_exact_size(Vec2::new(card_w, card_h), Sense::hover());
     let p = ui.painter_at(card_rect);
     p.rect_filled(card_rect, 5.0, bg_card());
     p.rect_stroke(card_rect, 5.0, Stroke::new(1.0_f32, BORDER_SUBTLE));
 
-    let (peak_bhp, peak_bhp_rpm, peak_nm, _) = compute_dyno_peaks(snap);
+    let (peak_bhp, peak_bhp_rpm, peak_nm, peak_nm_rpm) = compute_dyno_peaks(snap);
     p.text(
         Pos2::new(card_rect.left() + 10.0, card_rect.top() + 8.0),
         Align2::LEFT_TOP,
-        "DYNO CURVE",
-        FontId::monospace(10.0),
+        "DYNO",
+        FontId::proportional(11.0),
         TEXT_MUTED,
     );
-    p.text(
-        Pos2::new(card_rect.right() - 48.0, card_rect.top() + 8.0),
-        Align2::RIGHT_TOP,
-        format!("{:.0} BHP @ {:.1}k  |  {:.0} Nm", peak_bhp, peak_bhp_rpm * 0.001, peak_nm),
-        FontId::monospace(9.5),
-        TEXT_PRIMARY,
-    );
-    let clr_rect = Rect::from_min_size(Pos2::new(card_rect.right() - 40.0, card_rect.top() + 5.0), Vec2::new(32.0, 16.0));
+
+    // Quick [PULL] and [CLR] actions in dyno card header
+    let pull_rect = Rect::from_min_size(Pos2::new(card_rect.right() - 78.0, card_rect.top() + 5.0), Vec2::new(36.0, 17.0));
+    let clr_rect = Rect::from_min_size(Pos2::new(card_rect.right() - 38.0, card_rect.top() + 5.0), Vec2::new(30.0, 17.0));
+    let pull_resp = ui.interact(pull_rect, ui.id().with("dyno_pull"), Sense::click());
     let clr_resp = ui.interact(clr_rect, ui.id().with("dyno_clr"), Sense::click());
+    if pull_resp.clicked() {
+        ctrl.bench_mode = BenchMode::DynoSweep;
+        ctrl.start_dyno_sweep = true;
+    }
     if clr_resp.clicked() {
         ctrl.clear_dyno_trace = true;
     }
+    p.rect_filled(
+        pull_rect,
+        3.0,
+        if snap.dyno_sweep_running {
+            Color32::from_rgb(28, 70, 48)
+        } else if pull_resp.hovered() {
+            Color32::from_rgb(28, 36, 46)
+        } else {
+            BG_PILL
+        },
+    );
+    p.text(
+        pull_rect.center(),
+        Align2::CENTER_CENTER,
+        if snap.dyno_sweep_running { "RUN" } else { "PULL" },
+        FontId::proportional(9.5),
+        if snap.dyno_sweep_running || pull_resp.hovered() { ACCENT_GREEN } else { TEXT_PRIMARY },
+    );
     p.text(
         clr_rect.center(),
         Align2::CENTER_CENTER,
         "CLR",
-        FontId::monospace(9.0),
+        FontId::proportional(9.5),
         if clr_resp.hovered() { ACCENT_RED } else { TEXT_MUTED },
     );
 
+    // Dual Y-axes: Left Green (Power 0..1000 BHP), Right Amber (Torque 0..500 Nm)
     let pad = Rect::from_min_max(
-        Pos2::new(card_rect.left() + 30.0, card_rect.top() + 28.0),
-        Pos2::new(card_rect.right() - 12.0, card_rect.bottom() - 20.0),
+        Pos2::new(card_rect.left() + 34.0, card_rect.top() + 34.0),
+        Pos2::new(card_rect.right() - 34.0, card_rect.bottom() - 24.0),
     );
+    let max_bhp = 1000.0_f32;
+    let max_nm = 500.0_f32;
+    let rpm_span = (DYNO_MAX_RPM - DYNO_MIN_RPM) as f32;
 
-    // Subtle horizontal & vertical reference grid with labeled ticks
-    for &(bhp_tick, lbl) in &[(250.0, "250"), (500.0, "500"), (750.0, "750"), (1000.0, "1k")] {
-        let y = pad.bottom() - (bhp_tick / 1000.0) * pad.height();
+    for &(frac, bhp_lbl, nm_lbl) in &[
+        (0.25_f32, "250", "125"),
+        (0.50_f32, "500", "250"),
+        (0.75_f32, "750", "375"),
+        (1.00_f32, "1000", "500"),
+    ] {
+        let y = pad.bottom() - frac * pad.height();
         p.line_segment(
             [Pos2::new(pad.left(), y), Pos2::new(pad.right(), y)],
             Stroke::new(0.6_f32, Color32::from_rgb(20, 24, 32)),
         );
-        p.text(Pos2::new(pad.left() - 4.0, y), Align2::RIGHT_CENTER, lbl, FontId::monospace(8.5), TEXT_MUTED);
+        p.text(Pos2::new(pad.left() - 4.0, y), Align2::RIGHT_CENTER, bhp_lbl, FontId::proportional(9.0), ACCENT_GREEN);
+        p.text(Pos2::new(pad.right() + 4.0, y), Align2::LEFT_CENTER, nm_lbl, FontId::proportional(9.0), ACCENT_AMBER);
     }
-    let rpm_span = (DYNO_MAX_RPM - DYNO_MIN_RPM) as f32;
-    for &(rpm_tick, lbl) in &[(8000.0, "8k"), (12000.0, "12k"), (16000.0, "16k"), (20000.0, "20k")] {
+
+    for &(rpm_tick, lbl) in &[
+        (6000.0, "6k"),
+        (8000.0, "8k"),
+        (10000.0, "10k"),
+        (12000.0, "12k"),
+        (14000.0, "14k"),
+        (16000.0, "16k"),
+        (18000.0, "18k"),
+        (20000.0, "20k"),
+    ] {
         let nx = ((rpm_tick - DYNO_MIN_RPM as f32) / rpm_span).clamp(0.0, 1.0);
         let x = pad.left() + nx * pad.width();
         p.line_segment(
             [Pos2::new(x, pad.top()), Pos2::new(x, pad.bottom())],
             Stroke::new(0.6_f32, Color32::from_rgb(20, 24, 32)),
         );
-        p.text(Pos2::new(x, pad.bottom() + 4.0), Align2::CENTER_TOP, lbl, FontId::monospace(8.5), TEXT_MUTED);
+        p.text(Pos2::new(x, pad.bottom() + 5.0), Align2::CENTER_TOP, lbl, FontId::proportional(9.0), TEXT_MUTED);
     }
 
-    let mut bhp_pts = Vec::new();
-    let mut nm_pts = Vec::new();
+    // Gather smoothed recorded data samples (rpm, bhp, nm)
+    let mut rec_samples: Vec<(f32, f32, f32)> = Vec::new();
     for i in 0..DYNO_BINS {
         let pt = snap.dyno_curve[i];
         if pt.recorded {
@@ -1800,63 +1865,159 @@ fn draw_dyno_card(ui: &mut egui::Ui, snap: &TelemetrySnapshot, ctrl: &mut Shared
             let mut sum_t = pt.torque_nm;
             let mut w = 1.0_f32;
             if i > 0 && snap.dyno_curve[i - 1].recorded {
-                sum_p += 0.45 * snap.dyno_curve[i - 1].power_bhp;
-                sum_t += 0.45 * snap.dyno_curve[i - 1].torque_nm;
-                w += 0.45;
+                sum_p += 0.5 * snap.dyno_curve[i - 1].power_bhp;
+                sum_t += 0.5 * snap.dyno_curve[i - 1].torque_nm;
+                w += 0.5;
             }
             if i + 1 < DYNO_BINS && snap.dyno_curve[i + 1].recorded {
-                sum_p += 0.45 * snap.dyno_curve[i + 1].power_bhp;
-                sum_t += 0.45 * snap.dyno_curve[i + 1].torque_nm;
-                w += 0.45;
+                sum_p += 0.5 * snap.dyno_curve[i + 1].power_bhp;
+                sum_t += 0.5 * snap.dyno_curve[i + 1].torque_nm;
+                w += 0.5;
             }
-            let nx = ((pt.rpm - DYNO_MIN_RPM as f32) / rpm_span).clamp(0.0, 1.0);
-            let x = pad.left() + nx * pad.width();
-            bhp_pts.push(Pos2::new(x, pad.bottom() - ((sum_p / w) / 1000.0).clamp(0.0, 1.0) * pad.height()));
-            nm_pts.push(Pos2::new(x, pad.bottom() - ((sum_t / w) / 450.0).clamp(0.0, 1.0) * pad.height()));
+            rec_samples.push((pt.rpm, (sum_p / w).max(0.0), (sum_t / w).max(0.0)));
         }
     }
 
-    // Subtle shaded ribbon under the recorded BHP curve
+    // Build smooth Catmull-Rom curve points
+    let mut spline_data: Vec<(f32, f32, f32)> = Vec::new();
+    let mut bhp_pts: Vec<Pos2> = Vec::new();
+    let mut nm_pts: Vec<Pos2> = Vec::new();
+    if rec_samples.len() >= 2 {
+        let n = rec_samples.len();
+        for i in 0..(n - 1) {
+            let s0 = rec_samples[i.saturating_sub(1)];
+            let s1 = rec_samples[i];
+            let s2 = rec_samples[i + 1];
+            let s3 = rec_samples[(i + 2).min(n - 1)];
+            let sub_steps = if i + 2 == n { 5 } else { 4 };
+            let limit = if i + 2 == n { sub_steps } else { sub_steps - 1 };
+            for step in 0..=limit {
+                let t = step as f32 / 4.0;
+                let rpm = catmull_rom_scalar(s0.0, s1.0, s2.0, s3.0, t).clamp(DYNO_MIN_RPM as f32, DYNO_MAX_RPM as f32);
+                let bhp = catmull_rom_scalar(s0.1, s1.1, s2.1, s3.1, t).clamp(0.0, max_bhp);
+                let nm = catmull_rom_scalar(s0.2, s1.2, s2.2, s3.2, t).clamp(0.0, max_nm);
+                let x = pad.left() + ((rpm - DYNO_MIN_RPM as f32) / rpm_span).clamp(0.0, 1.0) * pad.width();
+                let y_bhp = pad.bottom() - (bhp / max_bhp).clamp(0.0, 1.0) * pad.height();
+                let y_nm = pad.bottom() - (nm / max_nm).clamp(0.0, 1.0) * pad.height();
+                spline_data.push((rpm, bhp, nm));
+                bhp_pts.push(Pos2::new(x, y_bhp));
+                nm_pts.push(Pos2::new(x, y_nm));
+            }
+        }
+    }
+
     if bhp_pts.len() >= 2 {
-        let area_col = Color32::from_rgba_unmultiplied(72, 188, 120, 28);
-        for w in bhp_pts.windows(2) {
-            if (w[1].x - w[0].x).abs() > 0.5 && (pad.bottom() - w[0].y).max(pad.bottom() - w[1].y) > 0.5 {
-                let quad = vec![
-                    w[0],
-                    w[1],
-                    Pos2::new(w[1].x, pad.bottom()),
-                    Pos2::new(w[0].x, pad.bottom()),
-                ];
-                p.add(egui::Shape::convex_polygon(quad, area_col, Stroke::NONE));
+        let bhp_area = Color32::from_rgba_unmultiplied(72, 188, 120, 26);
+        let nm_area = Color32::from_rgba_unmultiplied(222, 158, 62, 14);
+        for w in nm_pts.windows(2) {
+            if (w[1].x - w[0].x).abs() > 0.4 && (pad.bottom() - w[0].y).max(pad.bottom() - w[1].y) > 0.4 {
+                p.add(egui::Shape::convex_polygon(
+                    vec![w[0], w[1], Pos2::new(w[1].x, pad.bottom()), Pos2::new(w[0].x, pad.bottom())],
+                    nm_area,
+                    Stroke::NONE,
+                ));
             }
         }
-        p.add(egui::Shape::line(nm_pts, Stroke::new(1.5_f32, ACCENT_AMBER)));
-        p.add(egui::Shape::line(bhp_pts, Stroke::new(2.0_f32, ACCENT_GREEN)));
+        for w in bhp_pts.windows(2) {
+            if (w[1].x - w[0].x).abs() > 0.4 && (pad.bottom() - w[0].y).max(pad.bottom() - w[1].y) > 0.4 {
+                p.add(egui::Shape::convex_polygon(
+                    vec![w[0], w[1], Pos2::new(w[1].x, pad.bottom()), Pos2::new(w[0].x, pad.bottom())],
+                    bhp_area,
+                    Stroke::NONE,
+                ));
+            }
+        }
+        p.add(egui::Shape::line(nm_pts, Stroke::new(1.7_f32, ACCENT_AMBER)));
+        p.add(egui::Shape::line(bhp_pts, Stroke::new(2.2_f32, ACCENT_GREEN)));
+
+        // Peak ring markers on curve
+        if peak_bhp > 1.0 {
+            let px = pad.left() + ((peak_bhp_rpm - DYNO_MIN_RPM as f32) / rpm_span).clamp(0.0, 1.0) * pad.width();
+            let py = pad.bottom() - (peak_bhp / max_bhp).clamp(0.0, 1.0) * pad.height();
+            p.circle_stroke(Pos2::new(px, py), 4.0, Stroke::new(1.4_f32, ACCENT_GREEN));
+        }
+        if peak_nm > 1.0 {
+            let tx = pad.left() + ((peak_nm_rpm - DYNO_MIN_RPM as f32) / rpm_span).clamp(0.0, 1.0) * pad.width();
+            let ty = pad.bottom() - (peak_nm / max_nm).clamp(0.0, 1.0) * pad.height();
+            p.circle_stroke(Pos2::new(tx, ty), 3.6, Stroke::new(1.3_f32, ACCENT_AMBER));
+        }
     }
 
-    // Live RPM cursor
-    if snap.rpm >= DYNO_MIN_RPM as f64 {
+    // Hover crosshair readout (when cursor is inside plot area) OR live RPM readout
+    let hover_pos = ui.ctx().input(|i| i.pointer.hover_pos());
+    let mut header_summary = format!(
+        "Peak {:.0} BHP @ {:.1}k  •  {:.0} Nm @ {:.1}k",
+        peak_bhp,
+        peak_bhp_rpm * 0.001,
+        peak_nm,
+        peak_nm_rpm * 0.001
+    );
+
+    if let Some(hp) = hover_pos.filter(|pos| pad.contains(*pos)) {
+        let nx = ((hp.x - pad.left()) / pad.width()).clamp(0.0, 1.0);
+        let h_rpm = DYNO_MIN_RPM as f32 + nx * rpm_span;
+        p.line_segment(
+            [Pos2::new(hp.x, pad.top()), Pos2::new(hp.x, pad.bottom())],
+            Stroke::new(0.9_f32, Color32::from_rgba_unmultiplied(228, 232, 240, 80)),
+        );
+        // Sample interpolated BHP & Nm at hover RPM
+        if let Some((i_bhp, i_nm)) = sample_dyno_at_rpm(&spline_data, h_rpm) {
+            let cy_bhp = pad.bottom() - (i_bhp / max_bhp).clamp(0.0, 1.0) * pad.height();
+            let cy_nm = pad.bottom() - (i_nm / max_nm).clamp(0.0, 1.0) * pad.height();
+            p.circle_filled(Pos2::new(hp.x, cy_bhp), 3.5, ACCENT_GREEN);
+            p.circle_filled(Pos2::new(hp.x, cy_nm), 3.5, ACCENT_AMBER);
+            header_summary = format!("{:.0} RPM  •  {:.0} BHP  •  {:.0} Nm", h_rpm, i_bhp, i_nm);
+        }
+    } else if snap.rpm >= DYNO_MIN_RPM as f64 {
         let nx = (((snap.rpm as f32) - DYNO_MIN_RPM as f32) / rpm_span).clamp(0.0, 1.0);
         let x = pad.left() + nx * pad.width();
-        let y_bhp = pad.bottom() - ((snap.power_bhp as f32) / 1000.0).clamp(0.0, 1.0) * pad.height();
+        let y_bhp = pad.bottom() - ((snap.power_bhp as f32) / max_bhp).clamp(0.0, 1.0) * pad.height();
+        let y_nm = pad.bottom() - ((snap.torque_nm as f32) / max_nm).clamp(0.0, 1.0) * pad.height();
         p.line_segment(
             [Pos2::new(x, pad.top()), Pos2::new(x, pad.bottom())],
-            Stroke::new(0.8_f32, Color32::from_rgba_unmultiplied(228, 232, 240, 45)),
+            Stroke::new(0.8_f32, Color32::from_rgba_unmultiplied(228, 232, 240, 48)),
         );
-        p.circle_filled(Pos2::new(x, y_bhp), 3.5, TEXT_PRIMARY);
+        p.circle_filled(Pos2::new(x, y_nm), 2.8, ACCENT_AMBER);
+        p.circle_filled(Pos2::new(x, y_bhp), 3.6, TEXT_PRIMARY);
     }
+
+    p.text(
+        Pos2::new(card_rect.left() + 48.0, card_rect.top() + 8.5),
+        Align2::LEFT_TOP,
+        header_summary,
+        FontId::proportional(10.0),
+        TEXT_PRIMARY,
+    );
+}
+
+fn sample_dyno_at_rpm(samples: &[(f32, f32, f32)], target_rpm: f32) -> Option<(f32, f32)> {
+    if samples.len() < 2 {
+        return None;
+    }
+    if target_rpm < samples.first()?.0 || target_rpm > samples.last()?.0 {
+        return None;
+    }
+    for w in samples.windows(2) {
+        let (r0, p0, t0) = w[0];
+        let (r1, p1, t1) = w[1];
+        if target_rpm >= r0 && target_rpm <= r1 && (r1 - r0) > 1e-3 {
+            let u = (target_rpm - r0) / (r1 - r0);
+            return Some((p0 + (p1 - p0) * u, t0 + (t1 - t0) * u));
+        }
+    }
+    None
 }
 
 fn draw_diag_card(ui: &mut egui::Ui, snap: &TelemetrySnapshot, diag_plot: &mut DiagnosticPlot) {
-    let card_h = 182.0_f32;
-    let card_w = ui.available_width().max(260.0);
+    let card_h = 176.0_f32;
+    let card_w = ui.available_width().max(290.0);
     let (card_rect, _) = ui.allocate_exact_size(Vec2::new(card_w, card_h), Sense::hover());
     let p = ui.painter_at(card_rect);
     p.rect_filled(card_rect, 5.0, bg_card());
     p.rect_stroke(card_rect, 5.0, Stroke::new(1.0_f32, BORDER_SUBTLE));
 
     let tab1 = Rect::from_min_size(Pos2::new(card_rect.left() + 8.0, card_rect.top() + 5.0), Vec2::new(66.0, 17.0));
-    let tab2 = Rect::from_min_size(Pos2::new(card_rect.left() + 80.0, card_rect.top() + 5.0), Vec2::new(92.0, 17.0));
+    let tab2 = Rect::from_min_size(Pos2::new(card_rect.left() + 78.0, card_rect.top() + 5.0), Vec2::new(96.0, 17.0));
     if ui.interact(tab1, ui.id().with("tab_pv"), Sense::click()).clicked() {
         *diag_plot = DiagnosticPlot::PvDiagram;
     }
@@ -1867,14 +2028,14 @@ fn draw_diag_card(ui: &mut egui::Ui, snap: &TelemetrySnapshot, diag_plot: &mut D
         tab1.center(),
         Align2::CENTER_CENTER,
         "P-V LOOP",
-        FontId::monospace(9.5),
+        FontId::proportional(10.0),
         if *diag_plot == DiagnosticPlot::PvDiagram { ACCENT_CYAN } else { TEXT_MUTED },
     );
     p.text(
         tab2.center(),
         Align2::CENTER_CENTER,
         "EXHAUST WAVE",
-        FontId::monospace(9.5),
+        FontId::proportional(10.0),
         if *diag_plot == DiagnosticPlot::Waveform { ACCENT_CYAN } else { TEXT_MUTED },
     );
 
@@ -1888,8 +2049,8 @@ fn draw_diag_card(ui: &mut egui::Ui, snap: &TelemetrySnapshot, diag_plot: &mut D
             p.text(
                 Pos2::new(card_rect.right() - 10.0, card_rect.top() + 8.0),
                 Align2::RIGHT_TOP,
-                format!("{:.1} bar | {:.0} K", snap.cylinders[0].pressure_bar, snap.cylinders[0].temp_k),
-                FontId::monospace(9.5),
+                format!("{:.1} bar  |  {:.0} K", snap.cylinders[0].pressure_bar, snap.cylinders[0].temp_k),
+                FontId::proportional(10.0),
                 TEXT_PRIMARY,
             );
             for &(pr_tick, lbl) in &[(25.0, "25"), (50.0, "50"), (75.0, "75"), (100.0, "100")] {
@@ -1898,7 +2059,7 @@ fn draw_diag_card(ui: &mut egui::Ui, snap: &TelemetrySnapshot, diag_plot: &mut D
                     [Pos2::new(pad.left(), y), Pos2::new(pad.right(), y)],
                     Stroke::new(0.6_f32, Color32::from_rgb(20, 24, 32)),
                 );
-                p.text(Pos2::new(pad.left() - 4.0, y), Align2::RIGHT_CENTER, lbl, FontId::monospace(8.5), TEXT_MUTED);
+                p.text(Pos2::new(pad.left() - 4.0, y), Align2::RIGHT_CENTER, lbl, FontId::proportional(9.0), TEXT_MUTED);
             }
 
             let v_min = (CLEARANCE_VOL_M3 * 1e6) as f32 * 0.9;
@@ -1916,7 +2077,6 @@ fn draw_diag_card(ui: &mut egui::Ui, snap: &TelemetrySnapshot, diag_plot: &mut D
                 max_p = max_p.max(pr);
                 pts.push(map_pt(v, pr));
             }
-            // Subtle work-loop fill when cylinder loop has active pressure swing
             if pts.len() >= 3 && (max_p - min_p) > 0.8 {
                 let fill_col = Color32::from_rgba_unmultiplied(92, 180, 230, 22);
                 let center = pts.iter().fold(Vec2::ZERO, |acc, &pt| acc + pt.to_vec2()) / pts.len() as f32;
@@ -1963,7 +2123,7 @@ fn draw_diag_card(ui: &mut egui::Ui, snap: &TelemetrySnapshot, diag_plot: &mut D
 }
 
 fn draw_vitals_strip(ui: &mut egui::Ui, snap: &TelemetrySnapshot, ctrl: &SharedControls) {
-    let strip_w = ui.available_width().max(260.0);
+    let strip_w = ui.available_width().max(290.0);
     let (rect, _) = ui.allocate_exact_size(Vec2::new(strip_w, 42.0), Sense::hover());
     let p = ui.painter_at(rect);
     p.rect_filled(rect, 5.0, bg_card());
@@ -1985,12 +2145,12 @@ fn draw_vitals_strip(ui: &mut egui::Ui, snap: &TelemetrySnapshot, ctrl: &SharedC
                 Stroke::new(0.8_f32, BORDER_SUBTLE),
             );
         }
-        p.text(Pos2::new(cx, rect.top() + 8.0), Align2::CENTER_TOP, *lbl, FontId::monospace(8.5), TEXT_MUTED);
+        p.text(Pos2::new(cx, rect.top() + 7.0), Align2::CENTER_TOP, *lbl, FontId::proportional(9.0), TEXT_MUTED);
         p.text(
-            Pos2::new(cx, rect.top() + 21.0),
+            Pos2::new(cx, rect.top() + 20.0),
             Align2::CENTER_TOP,
             val,
-            FontId::monospace(10.5),
+            FontId::proportional(11.5),
             if *warn { ACCENT_RED } else { TEXT_PRIMARY },
         );
     }

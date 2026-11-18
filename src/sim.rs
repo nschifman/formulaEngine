@@ -841,8 +841,6 @@ pub struct EngineSim {
     interval_work_accum: f64,
     interval_angle_accum: f64,
     cycle_mean_torque_nm: f64,
-    last_omega: f64,
-    omega_dot: f64,
     filtered_torque_nm: f64,
     filtered_power_bhp: f64,
     filtered_ve: f64,
@@ -934,8 +932,6 @@ impl EngineSim {
             interval_work_accum: 0.0,
             interval_angle_accum: 0.0,
             cycle_mean_torque_nm: 0.0,
-            last_omega: 0.0,
-            omega_dot: 0.0,
             filtered_torque_nm: 0.0,
             filtered_power_bhp: 0.0,
             filtered_ve: 0.0,
@@ -1577,11 +1573,13 @@ impl EngineSim {
                 net_load_torque = max_brake_nm * (rpm / 6000.0).clamp(0.0, 1.5);
             }
             BenchMode::DynoRpmHold => {
+                eff_inertia += 0.28;
                 let target_omega = ctrl.dyno_hold_rpm * 2.0 * PI / 60.0;
                 let err = self.omega_rad_s - target_omega;
                 net_load_torque = (err * 45.0).clamp(-350.0, 800.0);
             }
             BenchMode::DynoSweep => {
+                eff_inertia += 0.28;
                 if self.dyno_sweep_running {
                     let target_omega = self.dyno_sweep_rpm * 2.0 * PI / 60.0;
                     let err = self.omega_rad_s - target_omega;
@@ -1634,8 +1632,6 @@ impl EngineSim {
 
         let net_torque = brake_engine_torque + starter_torque - net_load_torque;
         self.omega_rad_s = (self.omega_rad_s + (net_torque / eff_inertia) * dt).clamp(0.0, 2350.0);
-        self.omega_dot = (self.omega_rad_s - self.last_omega) / dt;
-        self.last_omega = self.omega_rad_s;
         rpm = self.omega_rad_s * 60.0 / (2.0 * PI);
 
         // 10. Thermal & Exhaust Gas Temperature (EGT) Simulation
@@ -1693,7 +1689,7 @@ impl EngineSim {
         } else {
             0.0
         };
-        let filter_alpha = (25.0 * dt).min(1.0);
+        let filter_alpha = (90.0 * dt).min(1.0);
         self.filtered_torque_nm += (torque_target - self.filtered_torque_nm) * filter_alpha;
         let inst_bhp = (self.filtered_torque_nm * self.omega_rad_s) / 745.69987;
         self.filtered_power_bhp += (inst_bhp - self.filtered_power_bhp) * filter_alpha;
@@ -1709,7 +1705,7 @@ impl EngineSim {
             && !global_spark_cut
             && self.post_cut_timer <= 0.0
             && self.shift_sync_timer <= 0.0
-            && self.omega_dot.abs() < 650.0
+            && self.firing_angle_buf[NUM_CYL - 1] > 0.0
             && sweep_settled
         {
             let bin = (((rpm - DYNO_MIN_RPM as f64) / DYNO_STEP_RPM as f64).round() as usize)
