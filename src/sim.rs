@@ -59,6 +59,7 @@ pub enum StrokePhase {
     Compression,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy)]
 pub struct SharedControls {
     // Test-cell rig & startup

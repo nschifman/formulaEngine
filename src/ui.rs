@@ -2,7 +2,7 @@ use std::f32::consts::PI;
 use std::sync::{Arc, Mutex};
 
 use eframe::egui::{
-    self, Align2, Color32, CursorIcon, FontId, Pos2, Rect, RichText, Rounding, Sense, Stroke, Vec2,
+    self, Align2, Color32, CursorIcon, FontId, Pos2, Rect, Rounding, Sense, Stroke, Vec2,
 };
 
 use crate::sim::{
@@ -27,11 +27,6 @@ fn bg_card() -> Color32 {
     Color32::from_rgba_unmultiplied(10, 12, 17, 205)
 }
 
-#[inline]
-fn bg_popover() -> Color32 {
-    Color32::from_rgba_unmultiplied(12, 15, 21, 242)
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DiagnosticPlot {
     PvDiagram,
@@ -53,7 +48,6 @@ pub struct FormulaApp {
     controls: Arc<Mutex<SharedControls>>,
     telemetry: Arc<Mutex<TelemetrySnapshot>>,
     diag_plot: DiagnosticPlot,
-    menu_open: bool,
     visuals_applied: bool,
     space_was_down: bool,
 
@@ -79,7 +73,6 @@ impl FormulaApp {
             controls,
             telemetry,
             diag_plot: DiagnosticPlot::PvDiagram,
-            menu_open: false,
             visuals_applied: false,
             space_was_down: false,
             cam_yaw: -0.62,
@@ -179,7 +172,6 @@ impl FormulaApp {
                 self.cam_yaw = -0.62;
                 self.cam_pitch = 0.34;
                 self.cam_zoom = 1.0;
-                self.menu_open = false;
             }
         });
     }
@@ -235,15 +227,6 @@ impl eframe::App for FormulaApp {
                     Rect::from_min_size(Pos2::new(full_rect.left() + 28.0, throttle_top), Vec2::new(24.0, throttle_h));
                 let throttle_hit_rect = throttle_bar_rect.expand2(Vec2::new(14.0, 10.0));
 
-                let hamburger_btn_rect = Rect::from_min_size(
-                    Pos2::new(full_rect.left() + 26.0, full_rect.bottom() - 48.0),
-                    Vec2::new(186.0, 32.0),
-                );
-                let popover_rect = Rect::from_min_size(
-                    Pos2::new(full_rect.left() + 26.0, hamburger_btn_rect.top() - 252.0),
-                    Vec2::new(242.0, 244.0),
-                );
-
                 let right_w = 332.0_f32;
                 let right_hud_rect = Rect::from_min_max(
                     Pos2::new(full_rect.right() - right_w - 18.0, full_rect.top() + 74.0),
@@ -252,12 +235,8 @@ impl eframe::App for FormulaApp {
 
                 let pointer_pos = ctx.input(|i| i.pointer.interact_pos());
                 let hover_pos = ctx.input(|i| i.pointer.hover_pos());
-                let menu_was_open = self.menu_open;
                 let pos_over_hud = |p: Pos2| {
-                    throttle_hit_rect.contains(p)
-                        || hamburger_btn_rect.contains(p)
-                        || (menu_was_open && popover_rect.contains(p))
-                        || right_hud_rect.contains(p)
+                    throttle_hit_rect.contains(p) || right_hud_rect.contains(p)
                 };
 
                 // 3. BUILD & RENDER LOW-POLY 3D V10 (first pass projects hit targets for hover highlights)
@@ -304,7 +283,6 @@ impl eframe::App for FormulaApp {
 
                 if engine_resp.drag_started_by(egui::PointerButton::Primary) {
                     if let Some(pos) = pointer_pos.filter(|p| !pos_over_hud(*p)) {
-                        self.menu_open = false;
                         let part = hits.hit_test(pos);
                         self.active_drag_part = part;
                         if part == EnginePart::FlywheelHandCrank {
@@ -348,7 +326,6 @@ impl eframe::App for FormulaApp {
 
                 if engine_resp.clicked() {
                     if let Some(pos) = pointer_pos.filter(|p| !pos_over_hud(*p)) {
-                        self.menu_open = false;
                         match hits.hit_test(pos) {
                             EnginePart::CylinderBlock => ctrl.set_preheat(!ctrl.preheat_on()),
                             EnginePart::PneumaticHeads => ctrl.toggle_pneumatics(),
@@ -402,21 +379,7 @@ impl eframe::App for FormulaApp {
                 // 7. RIGHT-SIDE CLEAN TELEMETRY GRAPHS
                 draw_right_hud(ui, right_hud_rect, &snap, &mut ctrl, &mut self.diag_plot);
 
-                // 8. BOTTOM-LEFT HAMBURGER MENU (Manual Rev, Auto Pull, Monza Lap, 7-Spd, Audio, Utilities)
-                draw_bottom_hamburger_menu(
-                    ui,
-                    &painter,
-                    hamburger_btn_rect,
-                    popover_rect,
-                    &snap,
-                    &mut ctrl,
-                    &mut self.menu_open,
-                    &mut self.cam_yaw,
-                    &mut self.cam_pitch,
-                    &mut self.cam_zoom,
-                );
-
-                // 9. SINGLE CLEAN BOTTOM-CENTER INTERACTIVE GUIDE / PART PROMPT
+                // 8. SINGLE CLEAN BOTTOM-CENTER INTERACTIVE GUIDE / PART PROMPT
                 draw_footer_prompt(&painter, arena_center.x, full_rect.bottom() - 14.0, &snap, &ctrl, active_highlight);
             });
 
@@ -1560,129 +1523,6 @@ fn draw_vertical_throttle_slider(
         "[Z/X] Shift  •  [Q] Auto  •  [ESC] Reset",
         FontId::proportional(10.5),
         Color32::from_rgb(102, 110, 125),
-    );
-}
-
-#[allow(clippy::too_many_arguments)]
-fn draw_bottom_hamburger_menu(
-    ui: &mut egui::Ui,
-    p: &egui::Painter,
-    btn_rect: Rect,
-    popover_rect: Rect,
-    snap: &TelemetrySnapshot,
-    ctrl: &mut SharedControls,
-    menu_open: &mut bool,
-    cam_yaw: &mut f32,
-    cam_pitch: &mut f32,
-    cam_zoom: &mut f32,
-) {
-    let resp = ui.interact(btn_rect, ui.id().with("hamburger_btn"), Sense::click());
-    if resp.clicked() {
-        *menu_open = !*menu_open;
-    }
-    let fill = if *menu_open || resp.hovered() {
-        Color32::from_rgb(24, 28, 37)
-    } else {
-        BG_PILL
-    };
-    p.rect_filled(btn_rect, 4.0, fill);
-    p.rect_stroke(btn_rect, 4.0, Stroke::new(1.0_f32, BORDER_SUBTLE));
-
-    let icon_x0 = btn_rect.left() + 11.0;
-    let icon_x1 = btn_rect.left() + 25.0;
-    let cy = btn_rect.center().y;
-    for &dy in &[-4.5_f32, 0.0_f32, 4.5_f32] {
-        p.line_segment(
-            [Pos2::new(icon_x0, cy + dy), Pos2::new(icon_x1, cy + dy)],
-            Stroke::new(1.6_f32, TEXT_PRIMARY),
-        );
-    }
-
-    let mode_text = match ctrl.bench_mode {
-        BenchMode::FreeRev => "MANUAL REV".to_string(),
-        BenchMode::DynoSweep => {
-            if snap.dyno_sweep_running {
-                "AUTO PULL...".to_string()
-            } else {
-                "AUTO PULL".to_string()
-            }
-        }
-        BenchMode::MonzaHotlapAuto => format!("MONZA • {}", snap.monza_sector_name),
-        BenchMode::TrackManualGearbox => format!("GEAR {} [Z/X]", ctrl.requested_gear),
-        BenchMode::DynoManualBrake | BenchMode::DynoRpmHold => "DYNO BENCH".to_string(),
-    };
-    p.text(
-        Pos2::new(icon_x1 + 10.0, cy),
-        Align2::LEFT_CENTER,
-        mode_text,
-        FontId::proportional(11.0),
-        ACCENT_CYAN,
-    );
-
-    if !*menu_open {
-        return;
-    }
-
-    p.rect_filled(popover_rect, 5.0, bg_popover());
-    p.rect_stroke(popover_rect, 5.0, Stroke::new(1.0_f32, Color32::from_rgb(44, 52, 66)));
-
-    ui.allocate_new_ui(
-        egui::UiBuilder::new().max_rect(popover_rect.shrink(10.0)),
-        |ui| {
-            ui.label(RichText::new("DRIVE / TEST MODE").size(10.0).color(TEXT_MUTED));
-            let mode_items = [
-                (BenchMode::FreeRev, "Manual Rev"),
-                (BenchMode::DynoSweep, "Auto Pull (5.5k–19.5k)"),
-                (BenchMode::MonzaHotlapAuto, "Monza Lap (Auto)"),
-                (BenchMode::TrackManualGearbox, "7-Spd Gearbox [Z/X]"),
-            ];
-            for &(m, label) in &mode_items {
-                let sel = ctrl.bench_mode == m;
-                if ui
-                    .add_sized([220.0, 22.0], egui::SelectableLabel::new(sel, label))
-                    .clicked()
-                {
-                    ctrl.bench_mode = m;
-                    if m == BenchMode::DynoSweep {
-                        ctrl.start_dyno_sweep = true;
-                    } else if m == BenchMode::MonzaHotlapAuto && !snap.is_running {
-                        ctrl.quick_start_trigger = true;
-                    }
-                    *menu_open = false;
-                }
-            }
-
-            ui.separator();
-
-            ui.horizontal(|ui| {
-                if ui.small_button("Auto Start [Q]").clicked() {
-                    ctrl.quick_start_trigger = true;
-                    *menu_open = false;
-                }
-                if ui.small_button("Reset [ESC]").clicked() {
-                    ctrl.reset_repair_trigger = true;
-                    *cam_yaw = -0.62;
-                    *cam_pitch = 0.34;
-                    *cam_zoom = 1.0;
-                    *menu_open = false;
-                }
-                if ui.small_button("View [R]").clicked() {
-                    *cam_yaw = -0.62;
-                    *cam_pitch = 0.34;
-                    *cam_zoom = 1.0;
-                    *menu_open = false;
-                }
-            });
-
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                let mute_lbl = if ctrl.muted { "Muted" } else { "Audio" };
-                if ui.small_button(mute_lbl).clicked() {
-                    ctrl.muted = !ctrl.muted;
-                }
-                ui.add(egui::Slider::new(&mut ctrl.master_volume, 0.0..=1.5).show_value(false));
-            });
-        },
     );
 }
 
