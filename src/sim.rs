@@ -1205,7 +1205,7 @@ impl EngineSim {
             self.monza_sector_name = "Dyno Cell";
         }
 
-        // Handle gear changes with smooth dog-box synchronization (no instantaneous RPM discontinuity)
+        // Handle gear changes with smooth dog-box synchronization (no instantaneous RPM or acoustic discontinuity)
         let in_gearbox_mode = matches!(
             ctrl.bench_mode,
             BenchMode::TrackManualGearbox | BenchMode::MonzaHotlapAuto
@@ -1213,13 +1213,13 @@ impl EngineSim {
         if in_gearbox_mode {
             let req_g = ctrl.requested_gear.clamp(1, 7);
             if req_g > self.last_gear {
-                self.shift_cut_timer = 0.038;
-                self.shift_sync_timer = 0.038;
+                self.shift_cut_timer = 0.030;
+                self.shift_sync_timer = 0.036;
                 self.shift_cooldown = 0.10;
                 self.last_gear = req_g;
             } else if req_g < self.last_gear {
-                self.blip_timer = 0.045;
-                self.shift_sync_timer = 0.040;
+                self.blip_timer = 0.042;
+                self.shift_sync_timer = 0.036;
                 self.shift_cooldown = 0.10;
                 self.last_gear = req_g;
             }
@@ -1271,7 +1271,8 @@ impl EngineSim {
         } else {
             self.rev_limiter_active = false;
         }
-        let global_spark_cut = self.rev_cut_timer > 0.0 || self.shift_cut_timer > 0.0;
+        let fuel_cut = self.rev_cut_timer > 0.0 || self.shift_cut_timer > 0.0;
+        let global_spark_cut = fuel_cut;
         if global_spark_cut {
             self.post_cut_timer = 0.08;
         } else if self.post_cut_timer > 0.0 {
@@ -1391,8 +1392,8 @@ impl EngineSim {
 
             dm_plenum_out += dm_in / dt;
 
-            // Fuel injection during intake stroke
-            if dm_in > 0.0 && ctrl.fuel_pump_on {
+            // Fuel injection during intake stroke (cut cleanly during shift/rev cut for click-free seamless shifts)
+            if dm_in > 0.0 && ctrl.fuel_pump_on && !fuel_cut {
                 let target_afr = AFR_STOICH * ctrl.lambda_target.clamp(0.72, 1.25);
                 cyl.fuel_mass += dm_in / target_afr;
             }
@@ -1482,10 +1483,11 @@ impl EngineSim {
 
             // Gas-dynamic runner & collector flow (ported from engine-sim CombustionChamber + ExhaustSystem)
             cyl.runner_gas.add_flow_from_cylinder(dm_ex, cyl.temp_k, dt);
-            if dm_ex > 0.0 && cyl.unburnt_fuel > 1e-6 && self.egt_c > 350.0 && theta > 2.2 {
-                // Overrun / ignition-cut thermal pop inside hot primary header
-                cyl.runner_gas.e_internal += cyl.unburnt_fuel * Q_LHV_FUEL * 0.12;
-                cyl.unburnt_fuel = 0.0;
+            if cyl.unburnt_fuel > 1e-8 && self.egt_c > 350.0 {
+                // Smooth afterburn oxidation in hot primary header (continuous heat release prevents derivative click)
+                let d_burn = cyl.unburnt_fuel * (12.0 * dt).min(1.0);
+                cyl.runner_gas.e_internal += d_burn * Q_LHV_FUEL * 0.08;
+                cyl.unburnt_fuel = (cyl.unburnt_fuel - d_burn).max(0.0);
             }
             cyl.runner_gas.dissipate_excess_velocity();
             cyl.runner_gas.flow_to_node(&mut self.collectors[bank], dt, 0.00185);
@@ -1593,14 +1595,17 @@ impl EngineSim {
                 let f_roll = 180.0;
                 let f_total = f_aero + f_roll + (brake_torque_car / WHEEL_RADIUS_M);
 
-                // Smooth dog-box synchronizer during gear change vs locked driveline
+                // Smooth raised-sine dog-box synchronizer during gear change vs locked driveline
                 if self.shift_sync_timer > 0.0 {
                     self.shift_sync_timer = (self.shift_sync_timer - dt).max(0.0);
-                    let car_accel = -f_total / CAR_MASS_KG;
-                    self.car_speed_ms = (self.car_speed_ms + car_accel * dt).max(0.0);
+                    let u = 1.0 - (self.shift_sync_timer / 0.036).clamp(0.0, 1.0);
+                    let env = (u * PI).sin().powi(2);
                     let target_omega = (self.car_speed_ms / wheel_to_crank).clamp(350.0, 2150.0);
-                    let sync_tau = (self.omega_rad_s - target_omega) * 3.4;
+                    let k_sync = 1.2 + 9.0 * env + 8.0 * u * u;
+                    let sync_tau = ((self.omega_rad_s - target_omega) * k_sync).clamp(-900.0, 900.0);
                     net_load_torque = sync_tau;
+                    let car_accel = (sync_tau / wheel_to_crank - f_total) / CAR_MASS_KG;
+                    self.car_speed_ms = (self.car_speed_ms + car_accel * dt).max(0.0);
                 } else {
                     // Progressive carbon launch clutch in 1st gear until driveline locks up
                     let target_wheel_spd = self.omega_rad_s * wheel_to_crank;
@@ -1616,7 +1621,8 @@ impl EngineSim {
                         let reflected_inertia = CAR_MASS_KG * wheel_to_crank * wheel_to_crank;
                         eff_inertia += reflected_inertia;
                         net_load_torque = f_total * wheel_to_crank;
-                        self.car_speed_ms = (self.omega_rad_s * wheel_to_crank).max(0.0);
+                        let residual = target_wheel_spd - self.car_speed_ms;
+                        self.car_speed_ms = (self.car_speed_ms + residual * (220.0 * dt).min(1.0)).max(0.0);
                     }
                 }
                 self.monza_dist_m = (self.monza_dist_m + self.car_speed_ms * dt) % 5793.0;
@@ -2127,6 +2133,47 @@ mod tests {
             max_kmh > 260.0,
             "Expected Monza main straight acceleration > 260 km/h, reached {:.1} km/h",
             max_kmh
+        );
+    }
+
+    #[test]
+    fn upshift_under_full_throttle_has_no_acoustic_click_spike() {
+        let mut sim = EngineSim::new(48_000.0);
+        let mut ctrl = SharedControls::default();
+        sim.quick_start(&mut ctrl);
+        ctrl.bench_mode = BenchMode::TrackManualGearbox;
+        ctrl.requested_gear = 1;
+        ctrl.throttle = 1.0;
+
+        // Bring engine + chassis cleanly up to ~18,600 RPM in 1st gear
+        let wheel_to_crank_1 = WHEEL_RADIUS_M / (GEAR_RATIOS[0] * FINAL_DRIVE);
+        sim.omega_rad_s = 18_600.0 * 2.0 * PI / 60.0;
+        sim.car_speed_ms = sim.omega_rad_s * wheel_to_crank_1;
+
+        for _ in 0..12_000 {
+            sim.step_sample(&mut ctrl);
+        }
+
+        let (mut prev_l, mut prev_r) = sim.step_sample(&mut ctrl);
+        let mut max_delta = 0.0_f32;
+
+        // Upshift 1 -> 2, run 0.35s, then upshift 2 -> 3 and inspect sample-to-sample waveform deltas
+        ctrl.requested_gear = 2;
+        for step in 0..33_600 {
+            if step == 16_800 {
+                ctrl.requested_gear = 3;
+            }
+            let (l, r) = sim.step_sample(&mut ctrl);
+            let dl = (l - prev_l).abs();
+            let dr = (r - prev_r).abs();
+            max_delta = max_delta.max(dl).max(dr);
+            prev_l = l;
+            prev_r = r;
+        }
+        assert!(
+            max_delta < 0.35,
+            "Expected click-free upshift audio delta < 0.35, got {:.3}",
+            max_delta
         );
     }
 }
