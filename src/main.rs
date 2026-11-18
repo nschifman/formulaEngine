@@ -85,6 +85,7 @@ fn sync_controls_in(controls: &Arc<Mutex<SharedControls>>, local: &mut SharedCon
         guard.reset_repair_trigger = false;
         guard.start_dyno_sweep = false;
         guard.clear_dyno_trace = false;
+        guard.manual_crank_delta_rad = 0.0;
     }
 }
 

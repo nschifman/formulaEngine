@@ -86,6 +86,7 @@ pub struct SharedControls {
     pub clear_dyno_trace: bool,
     pub quick_start_trigger: bool,
     pub reset_repair_trigger: bool,
+    pub manual_crank_delta_rad: f64,
 
     // Audio
     pub master_volume: f32,
@@ -147,6 +148,7 @@ impl Default for SharedControls {
             clear_dyno_trace: false,
             quick_start_trigger: false,
             reset_repair_trigger: false,
+            manual_crank_delta_rad: 0.0,
 
             master_volume: 0.65,
             muted: false,
@@ -821,13 +823,23 @@ pub struct EngineSim {
     idle_integral: f64,
     effective_throttle: f64,
     rev_cut_timer: f64,
+    post_cut_timer: f64,
     rev_limiter_active: bool,
     shift_cut_timer: f64,
+    shift_sync_timer: f64,
     blip_timer: f64,
     shift_cooldown: f64,
     last_gear: usize,
 
-    // Filtered telemetry
+    // Cycle-averaged torque & filtered telemetry
+    firing_work_buf: [f64; NUM_CYL],
+    firing_angle_buf: [f64; NUM_CYL],
+    firing_slot: usize,
+    interval_work_accum: f64,
+    interval_angle_accum: f64,
+    cycle_mean_torque_nm: f64,
+    last_omega: f64,
+    omega_dot: f64,
     filtered_torque_nm: f64,
     filtered_power_bhp: f64,
     filtered_ve: f64,
@@ -905,12 +917,22 @@ impl EngineSim {
             idle_integral: 0.05,
             effective_throttle: 0.0,
             rev_cut_timer: 0.0,
+            post_cut_timer: 0.0,
             rev_limiter_active: false,
             shift_cut_timer: 0.0,
+            shift_sync_timer: 0.0,
             blip_timer: 0.0,
             shift_cooldown: 0.0,
             last_gear: 1,
 
+            firing_work_buf: [0.0; NUM_CYL],
+            firing_angle_buf: [0.0; NUM_CYL],
+            firing_slot: 0,
+            interval_work_accum: 0.0,
+            interval_angle_accum: 0.0,
+            cycle_mean_torque_nm: 0.0,
+            last_omega: 0.0,
+            omega_dot: 0.0,
             filtered_torque_nm: 0.0,
             filtered_power_bhp: 0.0,
             filtered_ve: 0.0,
@@ -985,6 +1007,15 @@ impl EngineSim {
         self.monza_dist_m = 0.0;
         self.dyno_sweep_running = false;
         self.plenum_pressure_pa = P_ATM;
+        self.post_cut_timer = 0.0;
+        self.shift_sync_timer = 0.0;
+        self.firing_work_buf = [0.0; NUM_CYL];
+        self.firing_angle_buf = [0.0; NUM_CYL];
+        self.interval_work_accum = 0.0;
+        self.interval_angle_accum = 0.0;
+        self.cycle_mean_torque_nm = 0.0;
+        self.filtered_torque_nm = 0.0;
+        self.filtered_power_bhp = 0.0;
 
         let col_area = 0.0052;
         self.collectors = [
@@ -1035,11 +1066,44 @@ impl EngineSim {
         }
         if ctrl.start_dyno_sweep {
             ctrl.start_dyno_sweep = false;
+            if self.coolant_temp_c < 60.0 || self.oil_temp_c < 60.0 || !ctrl.armed() || ctrl.n2_pressure_bar < 100.0 {
+                self.quick_start(ctrl);
+            }
             ctrl.bench_mode = BenchMode::DynoSweep;
             self.dyno_sweep_running = true;
             self.dyno_sweep_rpm = 5500.0;
             if self.omega_rad_s < 520.0 {
                 self.omega_rad_s = 5500.0 * 2.0 * PI / 60.0;
+            }
+        }
+        if ctrl.manual_crank_delta_rad.abs() > 1e-7 {
+            let delta = ctrl.manual_crank_delta_rad;
+            ctrl.manual_crank_delta_rad = 0.0;
+            if self.omega_rad_s < 15.0 {
+                let min_temp = self.coolant_temp_c.min(self.oil_temp_c);
+                let resistance = if min_temp < 58.0 { 0.08 } else { 1.0 };
+                let d_theta = delta * resistance;
+                self.crank_angle_rad = wrap_720(self.crank_angle_rad + d_theta);
+                for idx in 0..NUM_CYL {
+                    let cyl = &mut self.cylinders[idx];
+                    let theta = wrap_720(self.crank_angle_rad - cyl.firing_offset_rad);
+                    cyl.prev_local_angle = theta;
+                    let (x, _, _) = slider_crank(theta);
+                    cyl.piston_x = x;
+                    let vol = CLEARANCE_VOL_M3 + PISTON_AREA_M2 * x;
+                    cyl.intake_lift = intake_lift_norm(theta);
+                    cyl.exhaust_lift = exhaust_lift_norm(theta);
+                    if cyl.intake_lift > 0.05 || cyl.exhaust_lift > 0.05 {
+                        cyl.pressure_pa += (P_ATM - cyl.pressure_pa) * 0.35;
+                        cyl.air_mass = (cyl.pressure_pa * vol) / (R_AIR * cyl.temp_k);
+                    } else {
+                        cyl.pressure_pa = (cyl.air_mass * R_AIR * cyl.temp_k / vol).clamp(20_000.0, 4.0e6);
+                    }
+                    if idx == 0 {
+                        let pv_idx = (((theta / FOUR_PI) * PV_POINTS as f64) as usize).min(PV_POINTS - 1);
+                        self.pv_trace[pv_idx] = ((vol * 1e6) as f32, (cyl.pressure_pa * 1e-5) as f32);
+                    }
+                }
             }
         }
 
@@ -1141,7 +1205,7 @@ impl EngineSim {
             self.monza_sector_name = "Dyno Cell";
         }
 
-        // Handle gear changes (Upshift ignition cut / Downshift auto-blip)
+        // Handle gear changes with smooth dog-box synchronization (no instantaneous RPM discontinuity)
         let in_gearbox_mode = matches!(
             ctrl.bench_mode,
             BenchMode::TrackManualGearbox | BenchMode::MonzaHotlapAuto
@@ -1149,18 +1213,14 @@ impl EngineSim {
         if in_gearbox_mode {
             let req_g = ctrl.requested_gear.clamp(1, 7);
             if req_g > self.last_gear {
-                // Upshift ignition cut (25 ms) + RPM ratio drop
-                self.shift_cut_timer = 0.025;
-                self.shift_cooldown = 0.09;
-                let ratio_scale = GEAR_RATIOS[req_g - 1] / GEAR_RATIOS[self.last_gear - 1];
-                self.omega_rad_s *= ratio_scale;
+                self.shift_cut_timer = 0.038;
+                self.shift_sync_timer = 0.038;
+                self.shift_cooldown = 0.10;
                 self.last_gear = req_g;
             } else if req_g < self.last_gear {
-                // Downshift auto-blip (55 ms) + RPM ratio jump
-                self.blip_timer = 0.055;
-                self.shift_cooldown = 0.09;
-                let ratio_scale = GEAR_RATIOS[req_g - 1] / GEAR_RATIOS[self.last_gear - 1];
-                self.omega_rad_s = (self.omega_rad_s * ratio_scale).min(2100.0);
+                self.blip_timer = 0.045;
+                self.shift_sync_timer = 0.040;
+                self.shift_cooldown = 0.10;
                 self.last_gear = req_g;
             }
         } else {
@@ -1175,11 +1235,12 @@ impl EngineSim {
             requested_throttle = requested_throttle.max(0.75);
         }
 
-        // Dyno sweep override
+        // Dyno sweep override (finish 250 RPM below rev limiter so limiter cut never pollutes peak bin)
         if ctrl.bench_mode == BenchMode::DynoSweep && self.dyno_sweep_running {
             requested_throttle = 1.0;
             self.dyno_sweep_rpm += 2200.0 * dt;
-            if self.dyno_sweep_rpm >= ctrl.rev_limit_rpm.min(20000.0) {
+            let sweep_end = (ctrl.rev_limit_rpm - 250.0).clamp(10000.0, 20000.0);
+            if self.dyno_sweep_rpm >= sweep_end {
                 self.dyno_sweep_running = false;
                 ctrl.bench_mode = BenchMode::DynoManualBrake;
                 ctrl.dyno_brake_load = 0.25;
@@ -1211,6 +1272,11 @@ impl EngineSim {
             self.rev_limiter_active = false;
         }
         let global_spark_cut = self.rev_cut_timer > 0.0 || self.shift_cut_timer > 0.0;
+        if global_spark_cut {
+            self.post_cut_timer = 0.08;
+        } else if self.post_cut_timer > 0.0 {
+            self.post_cut_timer = (self.post_cut_timer - dt).max(0.0);
+        }
 
         // 4. Variable Intake Trumpet Length (75mm high-RPM to 135mm low/mid-RPM)
         let target_trumpet_m = if ctrl.trumpets_auto {
@@ -1514,7 +1580,7 @@ impl EngineSim {
                 if self.dyno_sweep_running {
                     let target_omega = self.dyno_sweep_rpm * 2.0 * PI / 60.0;
                     let err = self.omega_rad_s - target_omega;
-                    net_load_torque = (err * 12.0).clamp(-350.0, 700.0);
+                    net_load_torque = (err * 45.0).clamp(-350.0, 800.0);
                 }
             }
             BenchMode::TrackManualGearbox | BenchMode::MonzaHotlapAuto => {
@@ -1527,21 +1593,31 @@ impl EngineSim {
                 let f_roll = 180.0;
                 let f_total = f_aero + f_roll + (brake_torque_car / WHEEL_RADIUS_M);
 
-                // Progressive carbon launch clutch in 1st gear until driveline locks up
-                let target_wheel_spd = self.omega_rad_s * wheel_to_crank;
-                if g == 1 && (target_wheel_spd - self.car_speed_ms).abs() > 0.5 && self.car_speed_ms < 36.0 {
-                    let engage = ((rpm - 4300.0) / 3500.0).clamp(0.0, 1.0);
-                    let clutch_cap = 420.0 * engage;
-                    let slip = target_wheel_spd - self.car_speed_ms;
-                    let clutch_torque = (slip * 35.0).clamp(-clutch_cap, clutch_cap);
-                    net_load_torque = clutch_torque;
-                    let car_accel = (clutch_torque / wheel_to_crank - f_total) / CAR_MASS_KG;
+                // Smooth dog-box synchronizer during gear change vs locked driveline
+                if self.shift_sync_timer > 0.0 {
+                    self.shift_sync_timer = (self.shift_sync_timer - dt).max(0.0);
+                    let car_accel = -f_total / CAR_MASS_KG;
                     self.car_speed_ms = (self.car_speed_ms + car_accel * dt).max(0.0);
+                    let target_omega = (self.car_speed_ms / wheel_to_crank).clamp(350.0, 2150.0);
+                    let sync_tau = (self.omega_rad_s - target_omega) * 3.4;
+                    net_load_torque = sync_tau;
                 } else {
-                    let reflected_inertia = CAR_MASS_KG * wheel_to_crank * wheel_to_crank;
-                    eff_inertia += reflected_inertia;
-                    net_load_torque = f_total * wheel_to_crank;
-                    self.car_speed_ms = (self.omega_rad_s * wheel_to_crank).max(0.0);
+                    // Progressive carbon launch clutch in 1st gear until driveline locks up
+                    let target_wheel_spd = self.omega_rad_s * wheel_to_crank;
+                    if g == 1 && (target_wheel_spd - self.car_speed_ms).abs() > 0.5 && self.car_speed_ms < 36.0 {
+                        let engage = ((rpm - 4300.0) / 3500.0).clamp(0.0, 1.0);
+                        let clutch_cap = 420.0 * engage;
+                        let slip = target_wheel_spd - self.car_speed_ms;
+                        let clutch_torque = (slip * 35.0).clamp(-clutch_cap, clutch_cap);
+                        net_load_torque = clutch_torque;
+                        let car_accel = (clutch_torque / wheel_to_crank - f_total) / CAR_MASS_KG;
+                        self.car_speed_ms = (self.car_speed_ms + car_accel * dt).max(0.0);
+                    } else {
+                        let reflected_inertia = CAR_MASS_KG * wheel_to_crank * wheel_to_crank;
+                        eff_inertia += reflected_inertia;
+                        net_load_torque = f_total * wheel_to_crank;
+                        self.car_speed_ms = (self.omega_rad_s * wheel_to_crank).max(0.0);
+                    }
                 }
                 self.monza_dist_m = (self.monza_dist_m + self.car_speed_ms * dt) % 5793.0;
             }
@@ -1549,6 +1625,8 @@ impl EngineSim {
 
         let net_torque = brake_engine_torque + starter_torque - net_load_torque;
         self.omega_rad_s = (self.omega_rad_s + (net_torque / eff_inertia) * dt).clamp(0.0, 2350.0);
+        self.omega_dot = (self.omega_rad_s - self.last_omega) / dt;
+        self.last_omega = self.omega_rad_s;
         rpm = self.omega_rad_s * 60.0 / (2.0 * PI);
 
         // 10. Thermal & Exhaust Gas Temperature (EGT) Simulation
@@ -1581,26 +1659,61 @@ impl EngineSim {
             self.knock_active_timer = (self.knock_active_timer - dt).max(0.0);
         }
 
-        // 11. Filtered Telemetry & Dyno Curve Recording
-        let filter_alpha = (18.0 * dt).min(1.0);
-        self.filtered_torque_nm += (brake_engine_torque - self.filtered_torque_nm) * filter_alpha;
+        // 11. Exact 720-deg Cycle-Mean Shaft Work Torque & Smooth Dyno Curve Recording
+        if d_theta > 0.0 {
+            self.interval_work_accum += brake_engine_torque * d_theta;
+            self.interval_angle_accum += d_theta;
+            let interval_rad = FOUR_PI / NUM_CYL as f64;
+            if self.interval_angle_accum >= interval_rad {
+                self.firing_work_buf[self.firing_slot] = self.interval_work_accum;
+                self.firing_angle_buf[self.firing_slot] = self.interval_angle_accum;
+                self.firing_slot = (self.firing_slot + 1) % NUM_CYL;
+                self.interval_work_accum = 0.0;
+                self.interval_angle_accum = 0.0;
+
+                let sum_w: f64 = self.firing_work_buf.iter().sum();
+                let sum_a: f64 = self.firing_angle_buf.iter().sum();
+                if sum_a > 1e-6 {
+                    self.cycle_mean_torque_nm = sum_w / sum_a;
+                }
+            }
+        }
+
+        let torque_target = if rpm > 300.0 {
+            self.cycle_mean_torque_nm
+        } else {
+            0.0
+        };
+        let filter_alpha = (25.0 * dt).min(1.0);
+        self.filtered_torque_nm += (torque_target - self.filtered_torque_nm) * filter_alpha;
         let inst_bhp = (self.filtered_torque_nm * self.omega_rad_s) / 745.69987;
         self.filtered_power_bhp += (inst_bhp - self.filtered_power_bhp) * filter_alpha;
 
-        // Volumetric Efficiency across 10 cylinders
         let theoretical_air = 1.184 * DISP_VOL_M3 * NUM_CYL as f64;
         let ve = (sum_intake_mass / theoretical_air) * 100.0;
         self.filtered_ve += (ve - self.filtered_ve) * filter_alpha;
 
-        if rpm >= DYNO_MIN_RPM as f64 && rpm <= DYNO_MAX_RPM as f64 && self.effective_throttle > 0.85 {
+        let sweep_settled = ctrl.bench_mode != BenchMode::DynoSweep || self.dyno_sweep_rpm > 5700.0;
+        if rpm >= DYNO_MIN_RPM as f64
+            && rpm <= DYNO_MAX_RPM as f64
+            && self.effective_throttle > 0.90
+            && !global_spark_cut
+            && self.post_cut_timer <= 0.0
+            && self.shift_sync_timer <= 0.0
+            && self.omega_dot.abs() < 650.0
+            && sweep_settled
+        {
             let bin = (((rpm - DYNO_MIN_RPM as f64) / DYNO_STEP_RPM as f64).round() as usize)
                 .min(DYNO_BINS - 1);
             let t_nm = self.filtered_torque_nm.max(0.0) as f32;
             let p_bhp = self.filtered_power_bhp.max(0.0) as f32;
-            if !self.dyno_curve[bin].recorded || p_bhp > self.dyno_curve[bin].power_bhp {
+            if !self.dyno_curve[bin].recorded {
                 self.dyno_curve[bin].torque_nm = t_nm;
                 self.dyno_curve[bin].power_bhp = p_bhp;
                 self.dyno_curve[bin].recorded = true;
+            } else {
+                self.dyno_curve[bin].torque_nm = self.dyno_curve[bin].torque_nm * 0.85 + t_nm * 0.15;
+                self.dyno_curve[bin].power_bhp = self.dyno_curve[bin].power_bhp * 0.85 + p_bhp * 0.15;
             }
         }
     }
@@ -1985,6 +2098,23 @@ mod tests {
             "Expected full dyno curve bins recorded, got {}",
             recorded_bins
         );
+        // Verify smooth dyno curve (no sawtooth firing-ripple spikes between adjacent 250-RPM bins)
+        let mut prev_bhp: Option<f32> = None;
+        for pt in &snap.dyno_curve {
+            if pt.recorded && pt.rpm >= 7000.0 {
+                if let Some(pb) = prev_bhp {
+                    let jump = (pt.power_bhp - pb).abs();
+                    assert!(
+                        jump < 45.0,
+                        "Dyno curve jump too large at {} RPM: {:.1} -> {:.1} BHP",
+                        pt.rpm,
+                        pb,
+                        pt.power_bhp
+                    );
+                }
+                prev_bhp = Some(pt.power_bhp);
+            }
+        }
 
         // Switch to Monza qualifying lap for 8 seconds -> should reach high gear & > 260 km/h
         ctrl.bench_mode = BenchMode::MonzaHotlapAuto;
