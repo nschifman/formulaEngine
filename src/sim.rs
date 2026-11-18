@@ -92,6 +92,35 @@ pub struct SharedControls {
     pub muted: bool,
 }
 
+impl SharedControls {
+    pub fn preheat_on(&self) -> bool {
+        self.coolant_heater_on || self.oil_heater_on
+    }
+
+    pub fn set_preheat(&mut self, on: bool) {
+        self.coolant_heater_on = on;
+        self.oil_heater_on = on;
+    }
+
+    pub fn toggle_pneumatics(&mut self) {
+        self.n2_pressure_bar = if self.n2_pressure_bar >= 100.0 {
+            0.0
+        } else {
+            165.0
+        };
+    }
+
+    pub fn armed(&self) -> bool {
+        self.fuel_pump_on && self.ignition_on
+    }
+
+    pub fn toggle_arm(&mut self) {
+        let on = !self.armed();
+        self.fuel_pump_on = on;
+        self.ignition_on = on;
+    }
+}
+
 impl Default for SharedControls {
     fn default() -> Self {
         Self {
@@ -239,6 +268,9 @@ impl Default for TelemetrySnapshot {
     }
 }
 
+/// Per-cylinder acoustic micro-asymmetry for organic sub-harmonic texture
+const CYL_TRIM: [f64; NUM_CYL] = [1.00, 0.95, 1.04, 0.97, 1.02, 0.99, 1.05, 0.96, 1.01, 0.94];
+
 #[derive(Clone, Copy)]
 struct Cylinder {
     firing_offset_rad: f64,
@@ -253,6 +285,7 @@ struct Cylinder {
     comb_start_rad: f64,
     comb_energy_total: f64,
     prev_local_angle: f64,
+    prev_ex_lift: f64,
     spark_timer: f64,
     knock_timer: f64,
     last_intake_mass: f64,
@@ -282,6 +315,7 @@ impl Cylinder {
             comb_start_rad: 0.0,
             comb_energy_total: 0.0,
             prev_local_angle: 0.0,
+            prev_ex_lift: 0.0,
             spark_timer: 0.0,
             knock_timer: 0.0,
             last_intake_mass: 0.0,
@@ -296,11 +330,23 @@ impl Cylinder {
     }
 }
 
-/// 1D Acoustic Waveguide for one 5-into-1 bank exhaust manifold & tailpipe
+#[inline]
+fn read_frac(buf: &[f32], mask: usize, write_ptr: usize, delay_samples: f32) -> f32 {
+    let len = mask + 1;
+    let clamped = delay_samples.clamp(2.0, (len - 4) as f32);
+    let d0 = clamped.floor() as usize;
+    let frac = clamped - d0 as f32;
+    let i0 = (write_ptr + len - d0) & mask;
+    let i1 = (write_ptr + len - (d0 + 1)) & mask;
+    buf[i0] * (1.0 - frac) + buf[i1] * frac
+}
+
+/// 1D Nonlinear Shock-Steepening Waveguide for one 5-into-1 bank exhaust manifold & tailpipe
 struct BankWaveguide {
     pri_bufs: [[f32; 128]; 5],
     pri_ptrs: [usize; 5],
     pri_delays: [usize; 5],
+    pri_last: [f32; 5],
     tail_buf: [f32; 256],
     tail_ptr: usize,
     tail_delay: usize,
@@ -313,17 +359,18 @@ impl BankWaveguide {
     fn new(sample_rate: f64) -> Self {
         // Slight realistic primary length stagger (0.39m .. 0.44m) gives authentic 5-into-1 F1 rasp
         let pri_lengths = [0.395, 0.415, 0.435, 0.425, 0.405];
-        let c_ex = 560.0; // speed of sound in hot F1 exhaust gas (~800 C)
+        let c_ex = 580.0; // speed of sound in hot F1 exhaust gas
         let mut pri_delays = [24usize; 5];
         for i in 0..5 {
             let d = ((pri_lengths[i] / c_ex) * sample_rate).round() as usize;
             pri_delays[i] = d.clamp(6, 120);
         }
-        let tail_delay = (((0.82 / c_ex) * sample_rate).round() as usize).clamp(16, 240);
+        let tail_delay = (((0.78 / c_ex) * sample_rate).round() as usize).clamp(16, 240);
         Self {
             pri_bufs: [[0.0; 128]; 5],
             pri_ptrs: [0; 5],
             pri_delays,
+            pri_last: [0.0; 5],
             tail_buf: [0.0; 256],
             tail_ptr: 0,
             tail_delay,
@@ -336,14 +383,14 @@ impl BankWaveguide {
     fn step(&mut self, cyl_drives: [f32; 5], pop_noise: f32) -> f32 {
         let mut collector_sum = 0.0f32;
         for c in 0..5 {
-            let len = self.pri_delays[c];
             let p = self.pri_ptrs[c];
-            let read_idx = (p + 128 - len) & 127;
-            let delayed = self.pri_bufs[c][read_idx];
+            // Pressure-dependent acoustic propagation speed steepens high-pressure wavefronts
+            let d_eff = (self.pri_delays[c] as f32) - (self.pri_last[c] * 1.8).clamp(-3.0, 3.0);
+            let delayed = read_frac(&self.pri_bufs[c], 127, p, d_eff);
+            self.pri_last[c] = delayed;
 
-            // Primary pipe reflection + fresh blowdown pulse injection
-            let wave = cyl_drives[c] + delayed * 0.42;
-            self.pri_bufs[c][p] = wave.clamp(-6.0, 6.0);
+            let wave = cyl_drives[c] + delayed * 0.48;
+            self.pri_bufs[c][p] = wave.clamp(-8.0, 8.0);
             self.pri_ptrs[c] = (p + 1) & 127;
             collector_sum += delayed;
         }
@@ -352,23 +399,139 @@ impl BankWaveguide {
         collector_sum += self.pop_env * pop_noise;
         self.pop_env *= 0.992;
 
-        // 5-into-1 Tailpipe Waveguide with open-end acoustic reflection
+        // 5-into-1 Tailpipe Waveguide with nonlinear steepening & bright open-end reflection
         let tp = self.tail_ptr;
-        let t_read = (tp + 256 - self.tail_delay) & 255;
-        let tail_del = self.tail_buf[t_read];
-        self.tail_lp += 0.35 * (tail_del - self.tail_lp);
+        let t_eff = (self.tail_delay as f32) - (self.prev_col * 1.8).clamp(-3.0, 3.0);
+        let tail_del = read_frac(&self.tail_buf, 255, tp, t_eff);
+        self.tail_lp += 0.72 * (tail_del - self.tail_lp);
 
-        let col_wave = (collector_sum * 0.45 - 0.66 * self.tail_lp).clamp(-8.0, 8.0);
+        let col_wave = (collector_sum * 0.42 - 0.62 * self.tail_lp).clamp(-8.0, 8.0);
         self.tail_buf[tp] = col_wave;
         self.tail_ptr = (tp + 1) & 255;
 
-        // Open pipe end radiation (high-pass derivative + warm low-mid body + shock steepening)
+        // Open pipe end radiation (strong high-pass derivative preserves supersonic crackle)
         let diff = col_wave - self.prev_col;
         self.prev_col = col_wave;
-        let raw_rad = diff * 2.4 + col_wave * 0.65;
-        // Supersonic exhaust shock steepening (asymmetric saturation creates F1 brassiness)
-        let steep = (raw_rad * 1.65 + 0.16 * raw_rad * raw_rad).tanh();
-        steep
+        let raw_rad = diff * 2.2 + col_wave * 0.42;
+        (raw_rad * 1.35 + 0.20 * raw_rad * raw_rad).tanh()
+    }
+}
+
+/// Peaking EQ Biquad for the Inconel Megaphone Formant Resonator
+#[derive(Clone, Copy)]
+struct BiquadFilter {
+    b0: f32,
+    b1: f32,
+    b2: f32,
+    a1: f32,
+    a2: f32,
+    x1: f32,
+    x2: f32,
+    y1: f32,
+    y2: f32,
+}
+
+impl BiquadFilter {
+    fn peaking(sample_rate: f64, freq_hz: f64, q: f64, gain_db: f64) -> Self {
+        let a = 10.0_f64.powf(gain_db / 40.0);
+        let w0 = 2.0 * PI * (freq_hz.min(sample_rate * 0.45)) / sample_rate;
+        let alpha = w0.sin() / (2.0 * q);
+        let cos_w0 = w0.cos();
+
+        let b0 = 1.0 + alpha * a;
+        let b1 = -2.0 * cos_w0;
+        let b2 = 1.0 - alpha * a;
+        let a0 = 1.0 + alpha / a;
+        let a1 = -2.0 * cos_w0;
+        let a2 = 1.0 - alpha / a;
+
+        Self {
+            b0: (b0 / a0) as f32,
+            b1: (b1 / a0) as f32,
+            b2: (b2 / a0) as f32,
+            a1: (a1 / a0) as f32,
+            a2: (a2 / a0) as f32,
+            x1: 0.0,
+            x2: 0.0,
+            y1: 0.0,
+            y2: 0.0,
+        }
+    }
+
+    #[inline]
+    fn process(&mut self, x: f32) -> f32 {
+        let y = self.b0 * x + self.b1 * self.x1 + self.b2 * self.x2
+            - self.a1 * self.y1
+            - self.a2 * self.y2;
+        self.x2 = self.x1;
+        self.x1 = x;
+        self.y2 = self.y1;
+        self.y1 = y;
+        y
+    }
+}
+
+const IR_TAPS: usize = 96;
+
+/// 96-Tap FIR Impulse Response Convolver for Inconel megaphone & test-cell metallic reflections
+struct IrConvolver {
+    kernel: [f32; IR_TAPS],
+    buf: [f32; IR_TAPS],
+    ptr: usize,
+}
+
+impl IrConvolver {
+    fn new(sample_rate: f64, bank_offset: f32) -> Self {
+        let mut kernel = [0.0f32; IR_TAPS];
+        kernel[0] = 0.56;
+        let sr = sample_rate as f32;
+        let modes = [2400.0f32, 3800.0, 5600.0, 7800.0];
+        let decays = [1100.0f32, 1400.0, 1700.0, 2100.0];
+
+        for i in 1..IR_TAPS {
+            let t = i as f32 / sr;
+            let mut m_sum = 0.0f32;
+            for k in 0..4 {
+                let phase = 2.0 * std::f32::consts::PI * modes[k] * t + bank_offset * (k as f32 + 1.0);
+                m_sum += phase.sin() * (-decays[k] * t).exp() * 0.16;
+            }
+            kernel[i] = m_sum;
+        }
+        // Discrete early test-cell wall & floor micro-reflections (~0.45ms, ~0.95ms, ~1.55ms)
+        let r1 = ((0.00045 + bank_offset * 0.00004) * sr).round() as usize;
+        let r2 = ((0.00095 + bank_offset * 0.00006) * sr).round() as usize;
+        let r3 = ((0.00155 - bank_offset * 0.00005) * sr).round() as usize;
+        for &(idx, amp) in &[(r1, 0.24), (r2, -0.17), (r3, 0.11)] {
+            if idx > 0 && idx < IR_TAPS {
+                kernel[idx] += amp;
+            }
+        }
+
+        // Normalize L1 energy slightly so IR preserves dynamic headroom
+        let abs_sum: f32 = kernel.iter().map(|v| v.abs()).sum();
+        let norm = (1.65 / abs_sum.max(1.0)).min(1.0);
+        for v in &mut kernel {
+            *v *= norm;
+        }
+
+        Self {
+            kernel,
+            buf: [0.0; IR_TAPS],
+            ptr: 0,
+        }
+    }
+
+    #[inline]
+    fn process(&mut self, x: f32) -> f32 {
+        self.buf[self.ptr] = x;
+        let mut acc = 0.0f32;
+        let mut idx = self.ptr;
+        for k in 0..IR_TAPS {
+            acc += self.kernel[k] * self.buf[idx];
+            idx = if idx == 0 { IR_TAPS - 1 } else { idx - 1 };
+        }
+        self.ptr = (self.ptr + 1) % IR_TAPS;
+        acc
     }
 }
 
@@ -419,6 +582,11 @@ pub struct EngineSim {
     // Audio DSP state
     left_wg: BankWaveguide,
     right_wg: BankWaveguide,
+    mega_l: [BiquadFilter; 3],
+    mega_r: [BiquadFilter; 3],
+    ir_l: IrConvolver,
+    ir_r: IrConvolver,
+    comb_env: f32,
     intake_buf: [f32; 256],
     intake_ptr: usize,
     intake_lp: f32,
@@ -426,8 +594,6 @@ pub struct EngineSim {
     dc_prev_out_l: f32,
     dc_prev_in_r: f32,
     dc_prev_out_r: f32,
-    air_lp_l: f32,
-    air_lp_r: f32,
     rng_state: u32,
     starter_phase: f64,
 
@@ -452,8 +618,9 @@ impl EngineSim {
             pt.rpm = (DYNO_MIN_RPM + i * DYNO_STEP_RPM) as f32;
         }
 
+        let sr_safe = sample_rate.max(22050.0);
         let mut sim = Self {
-            sample_rate: sample_rate.max(22050.0),
+            sample_rate: sr_safe,
             cylinders,
             crank_angle_rad: 0.0,
             omega_rad_s: 0.0,
@@ -491,8 +658,21 @@ impl EngineSim {
             monza_dist_m: 0.0,
             monza_sector_name: "Pit Lane",
 
-            left_wg: BankWaveguide::new(sample_rate.max(22050.0)),
-            right_wg: BankWaveguide::new(sample_rate.max(22050.0)),
+            left_wg: BankWaveguide::new(sr_safe),
+            right_wg: BankWaveguide::new(sr_safe),
+            mega_l: [
+                BiquadFilter::peaking(sr_safe, 720.0, 1.8, 5.5),
+                BiquadFilter::peaking(sr_safe, 2150.0, 2.8, 8.5),
+                BiquadFilter::peaking(sr_safe, 4100.0, 3.2, 9.5),
+            ],
+            mega_r: [
+                BiquadFilter::peaking(sr_safe, 720.0, 1.8, 5.5),
+                BiquadFilter::peaking(sr_safe, 2150.0, 2.8, 8.5),
+                BiquadFilter::peaking(sr_safe, 4100.0, 3.2, 9.5),
+            ],
+            ir_l: IrConvolver::new(sr_safe, 0.0),
+            ir_r: IrConvolver::new(sr_safe, 0.42),
+            comb_env: 0.0,
             intake_buf: [0.0; 256],
             intake_ptr: 0,
             intake_lp: 0.0,
@@ -500,8 +680,6 @@ impl EngineSim {
             dc_prev_out_l: 0.0,
             dc_prev_in_r: 0.0,
             dc_prev_out_r: 0.0,
-            air_lp_l: 0.0,
-            air_lp_r: 0.0,
             rng_state: 0x1357_2468,
             starter_phase: 0.0,
 
@@ -557,6 +735,7 @@ impl EngineSim {
         self.monza_dist_m = 0.0;
         self.dyno_sweep_running = false;
         self.plenum_pressure_pa = P_ATM;
+        self.comb_env = 0.0;
 
         for c in &mut self.cylinders {
             *c = Cylinder::new(c.firing_offset_rad);
@@ -619,78 +798,135 @@ impl EngineSim {
         for _ in 0..SUBSTEPS {
             self.step_physics_substep(dt, ctrl);
             for i in 0..5 {
-                left_drive[i] += self.cylinders[i].ex_flow_pulse as f32 * 1.6;
-                right_drive[i] += self.cylinders[i + 5].ex_flow_pulse as f32 * 1.6;
+                left_drive[i] += self.cylinders[i].ex_flow_pulse as f32 * 0.5;
+                right_drive[i] += self.cylinders[i + 5].ex_flow_pulse as f32 * 0.5;
             }
             for c in &self.cylinders {
-                intake_drive += c.in_flow_pulse as f32 * 1.2;
+                intake_drive += c.in_flow_pulse as f32 * 1.1;
             }
         }
 
-        // Procedural audio synthesis at sample rate
+        // Inject jet shear turbulence proportional to exhaust mass flow
+        for i in 0..5 {
+            let jet_l = self.fast_noise() * left_drive[i].abs() * 0.28;
+            let jet_r = self.fast_noise() * right_drive[i].abs() * 0.28;
+            left_drive[i] += jet_l;
+            right_drive[i] += jet_r;
+        }
+
+        // 1. Nonlinear 5-into-1 Shock-Steepening Waveguides
         let pop_n_l = self.fast_noise();
         let pop_n_r = self.fast_noise();
-        let ex_l = self.left_wg.step(left_drive, pop_n_l);
-        let ex_r = self.right_wg.step(right_drive, pop_n_r);
+        let wg_l = self.left_wg.step(left_drive, pop_n_l);
+        let wg_r = self.right_wg.step(right_drive, pop_n_r);
 
-        // Variable intake trumpet waveguide resonator
+        // 2. Phase-Locked 72-deg V10 Harmonic & Megaphone Formant Exciter
+        let rpm = (self.omega_rad_s * 60.0 / (2.0 * PI)).max(0.0);
+        let rpm_norm = (rpm / 19_000.0).clamp(0.0, 1.15) as f32;
+        let firing_ok = ctrl.ignition_on
+            && ctrl.fuel_pump_on
+            && self.rev_cut_timer <= 0.0
+            && self.shift_cut_timer <= 0.0
+            && !self.valve_float_active
+            && rpm > 700.0;
+        let comb_target = if firing_ok {
+            (0.22 + 0.78 * self.effective_throttle as f32) * (0.25 + 0.75 * rpm_norm.sqrt())
+        } else if rpm > 900.0 {
+            // Pumping overrun groan without combustion fire
+            0.08 * rpm_norm
+        } else {
+            0.0
+        };
+        let env_rate = if comb_target > self.comb_env { 0.035 } else { 0.018 };
+        self.comb_env += env_rate * (comb_target - self.comb_env);
+
+        let ca = self.crank_angle_rad;
+        let shape = |mult: f64| -> f32 {
+            let s1 = (ca * mult).sin();
+            let s2 = (ca * mult * 2.0).sin();
+            ((s1 + 0.35 * s2) * 1.15).tanh() as f32
+        };
+        // High-RPM blossom weights: 2.5x/5x bark -> 7.5x/10x/15x metallic F1 scream
+        let hi_blossom = ((rpm_norm - 0.35) / 0.65).clamp(0.0, 1.0);
+        let scream_blossom = ((rpm_norm - 0.55) / 0.45).clamp(0.0, 1.0);
+
+        let bank_2_5 = shape(2.5) * 0.42;
+        let bank_7_5 = shape(7.5) * (0.18 + 0.36 * hi_blossom);
+        let bank_12_5 = shape(12.5) * (0.05 + 0.28 * scream_blossom);
+
+        let sum_5_0 = shape(5.0) * (0.38 + 0.25 * hi_blossom);
+        let sum_10_0 = shape(10.0) * (0.14 + 0.34 * hi_blossom);
+        let sum_15_0 = shape(15.0) * (0.04 + 0.28 * scream_blossom);
+        let sum_20_0 = shape(20.0) * (0.18 * scream_blossom);
+
+        let shared_orders = sum_5_0 + sum_10_0 + sum_15_0 + sum_20_0;
+        let exc_l = (shared_orders + bank_2_5 + bank_7_5 + bank_12_5) * self.comb_env * 0.26;
+        let exc_r = (shared_orders - bank_2_5 - bank_7_5 - bank_12_5) * self.comb_env * 0.26;
+
+        // 3. Variable intake trumpet waveguide resonator
         let total_intake_len = 0.085 + self.trumpet_length_m;
         let intake_delay = (((2.0 * total_intake_len / 346.0) * self.sample_rate).round() as usize)
             .clamp(8, 240);
         let ip = self.intake_ptr;
         let i_read = (ip + 256 - intake_delay) & 255;
         let i_del = self.intake_buf[i_read];
-        let i_wave = (intake_drive * 0.65 - 0.55 * i_del).clamp(-4.0, 4.0);
+        let i_wave = (intake_drive * 0.72 - 0.58 * i_del).clamp(-4.0, 4.0);
         self.intake_buf[ip] = i_wave;
         self.intake_ptr = (ip + 1) & 255;
-        self.intake_lp += 0.25 * (i_wave - self.intake_lp);
-        let intake_snd = ((i_wave - self.intake_lp) * 0.6 + self.intake_lp * 0.4)
-            * (0.18 + 0.82 * self.effective_throttle as f32);
+        self.intake_lp += 0.35 * (i_wave - self.intake_lp);
+        let intake_snd = ((i_wave - self.intake_lp) * 0.7 + self.intake_lp * 0.3)
+            * (0.15 + 0.85 * self.effective_throttle as f32);
 
         // Straight-cut camshaft gear & pneumatic valvetrain mechanical whine
-        let rpm = (self.omega_rad_s * 60.0 / (2.0 * PI)).max(0.0);
-        let mech_amp = ((rpm / 19000.0) as f32).clamp(0.0, 1.1) * 0.022;
-        let ca = self.crank_angle_rad;
+        let mech_amp = rpm_norm * 0.025;
         let gear_whine = (((ca * 11.0).sin() * 0.5 + (ca * 22.0).sin() * 0.35 + (ca * 5.0).sin() * 0.25)
             as f32)
             * mech_amp;
 
         // External pneumatic starter gun turbine sound
         let starter_snd = if ctrl.starter_active {
-            let st_freq = 420.0 + rpm * 0.35;
+            let st_freq = 440.0 + rpm * 0.35;
             self.starter_phase = (self.starter_phase + 2.0 * PI * st_freq / self.sample_rate) % (2.0 * PI);
-            let air_hiss = self.fast_noise() * 0.04;
-            (self.starter_phase.sin() as f32 * 0.08) + air_hiss
+            let air_hiss = self.fast_noise() * 0.045;
+            (self.starter_phase.sin() as f32 * 0.09) + air_hiss
         } else {
             0.0
         };
 
-        // Stereo mix (Left Bank skewed L, Right Bank skewed R, Intake & Mech centered)
-        let raw_l = ex_l * 0.58 + ex_r * 0.20 + intake_snd * 0.26 + gear_whine + starter_snd;
-        let raw_r = ex_r * 0.58 + ex_l * 0.20 + intake_snd * 0.26 + gear_whine + starter_snd;
+        // Combine Waveguides + Phase-Locked V10 Exciter -> 3-Band Megaphone Resonator -> 96-Tap IR
+        let ex_l = wg_l * 0.55 + exc_l;
+        let ex_r = wg_r * 0.55 + exc_r;
 
-        // 20 Hz DC blocking filter + mild air absorption smoothing
-        let dc_l = raw_l - self.dc_prev_in_l + 0.996 * self.dc_prev_out_l;
-        self.dc_prev_in_l = raw_l;
+        let mut mega_out_l = ex_l * 0.65 + ex_r * 0.18 + intake_snd * 0.22;
+        let mut mega_out_r = ex_r * 0.65 + ex_l * 0.18 + intake_snd * 0.22;
+        for b in 0..3 {
+            mega_out_l = self.mega_l[b].process(mega_out_l);
+            mega_out_r = self.mega_r[b].process(mega_out_r);
+        }
+
+        // 4. 96-Tap Metallic Megaphone & Test-Cell Early Reflection IR Convolver
+        let conv_l = self.ir_l.process(mega_out_l) + gear_whine + starter_snd;
+        let conv_r = self.ir_r.process(mega_out_r) + gear_whine + starter_snd;
+
+        // 20 Hz DC blocking filter (no aggressive upper-band lowpass!)
+        let dc_l = conv_l - self.dc_prev_in_l + 0.996 * self.dc_prev_out_l;
+        self.dc_prev_in_l = conv_l;
         self.dc_prev_out_l = dc_l;
 
-        let dc_r = raw_r - self.dc_prev_in_r + 0.996 * self.dc_prev_out_r;
-        self.dc_prev_in_r = raw_r;
+        let dc_r = conv_r - self.dc_prev_in_r + 0.996 * self.dc_prev_out_r;
+        self.dc_prev_in_r = conv_r;
         self.dc_prev_out_r = dc_r;
 
-        self.air_lp_l += 0.62 * (dc_l - self.air_lp_l);
-        self.air_lp_r += 0.62 * (dc_r - self.air_lp_r);
-
-        let gain = if ctrl.muted { 0.0 } else { ctrl.master_volume * 0.72 };
-        let out_l = (self.air_lp_l * gain).tanh();
-        let out_r = (self.air_lp_r * gain).tanh();
+        let gain = if ctrl.muted { 0.0 } else { ctrl.master_volume * 0.55 };
+        let out_l = (dc_l * gain).tanh();
+        let out_r = (dc_r * gain).tanh();
 
         // Update oscilloscope trace (decimated 2:1 so waveform displays ~10ms window cleanly)
         self.scope_decim = (self.scope_decim + 1) & 1;
         if self.scope_decim == 0 {
             let sp = self.scope_ptr;
-            self.scope_left[sp] = ex_l;
-            self.scope_right[sp] = ex_r;
+            self.scope_left[sp] = ex_l.clamp(-1.0, 1.0);
+            self.scope_right[sp] = ex_r.clamp(-1.0, 1.0);
             self.scope_audio[sp] = 0.5 * (out_l + out_r);
             self.scope_ptr = (sp + 1) % SCOPE_LEN;
         }
@@ -869,6 +1105,8 @@ impl EngineSim {
             // Valve lifts (0..1)
             let in_lift = (intake_lift_norm(theta) + valve_float_fraction).min(1.0);
             let ex_lift = (exhaust_lift_norm(theta) + valve_float_fraction).min(1.0);
+            let d_ex_lift = (ex_lift - cyl.prev_ex_lift).max(0.0);
+            cyl.prev_ex_lift = ex_lift;
             cyl.intake_lift = in_lift;
             cyl.exhaust_lift = ex_lift;
 
@@ -1004,10 +1242,13 @@ impl EngineSim {
             cyl.temp_k = (u_new / (m_new * CV_GAS)).clamp(240.0, 3400.0);
             cyl.pressure_pa = (m_new * R_AIR * cyl.temp_k / vol).clamp(12_000.0, 1.4e7);
 
-            // Exhaust valve opening blowdown & overrun pop detection
+            // Exhaust valve opening Friedlander blowdown shock + mass-flow pulse
+            let p_cyl_bar = (cyl.pressure_pa * 1e-5).max(1.0);
+            let shock = d_ex_lift * (p_cyl_bar - 1.0).max(0.0) * 18.0;
             if dm_ex > 0.0 {
                 let p_ratio = ((cyl.pressure_pa - p_ex_manifold) / 100_000.0).max(0.0);
-                cyl.ex_flow_pulse = (dm_ex / dt) * (1.0 + 0.55 * p_ratio.sqrt());
+                cyl.ex_flow_pulse =
+                    ((dm_ex / dt) * (1.0 + 0.65 * p_ratio.sqrt()) + shock) * CYL_TRIM[idx];
                 if cyl.unburnt_fuel > 1e-6 && self.egt_c > 350.0 && theta > 2.2 {
                     cyl.unburnt_fuel = 0.0;
                     if idx < 5 {
@@ -1017,7 +1258,7 @@ impl EngineSim {
                     }
                 }
             } else {
-                cyl.ex_flow_pulse = (dm_ex / dt) * 0.25;
+                cyl.ex_flow_pulse = ((dm_ex / dt) * 0.25 + shock * 0.5) * CYL_TRIM[idx];
             }
             cyl.in_flow_pulse = dm_in / dt;
 
@@ -1149,8 +1390,8 @@ impl EngineSim {
         rpm = self.omega_rad_s * 60.0 / (2.0 * PI);
 
         // 10. Thermal & Exhaust Gas Temperature (EGT) Simulation
-        let heater_coolant = if ctrl.coolant_heater_on { 5.2 } else { 0.0 };
-        let heater_oil = if ctrl.oil_heater_on { 5.0 } else { 0.0 };
+        let heater_coolant = if ctrl.coolant_heater_on { 7.2 } else { 0.0 };
+        let heater_oil = if ctrl.oil_heater_on { 7.0 } else { 0.0 };
         let power_kw = (brake_engine_torque * self.omega_rad_s).max(0.0) * 0.001;
 
         // Test cell cooling loop regulates near 88C unless pushed hard continuously
