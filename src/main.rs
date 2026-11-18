@@ -129,6 +129,17 @@ impl ResampleReader {
 
     #[inline]
     fn next_stereo(&mut self) -> (f32, f32) {
+        if (self.step - 1.0).abs() < 1e-4 {
+            if let Some(frame) = self.ring.pop_frame() {
+                self.cur = frame;
+                self.next = frame;
+            } else {
+                self.cur = (self.cur.0 * 0.992, self.cur.1 * 0.992);
+                self.next = self.cur;
+            }
+            return self.cur;
+        }
+
         let t = self.phase as f32;
         let out_l = self.cur.0 + (self.next.0 - self.cur.0) * t;
         let out_r = self.cur.1 + (self.next.1 - self.cur.1) * t;

@@ -633,10 +633,8 @@ impl JitterFilter {
         self.history[self.offset] = sample;
         self.offset = (self.offset + 1) % 10;
 
-        let s = self
-            .noise_lp
-            .fast_f(uniform_0_1 * 9.0 * self.jitter_scale)
-            .clamp(0.0, 9.0);
+        let raw_s = 0.6 + uniform_0_1 * 8.0 * self.jitter_scale;
+        let s = self.noise_lp.fast_f(raw_s).clamp(0.1, 8.9);
         let s0 = s.floor() as usize;
         let s1 = s.ceil() as usize;
         let frac = s - s0 as f32;
@@ -776,10 +774,10 @@ struct SynthChannel {
 impl SynthChannel {
     fn new(sample_rate: f64) -> Self {
         Self {
-            antialiasing: ButterworthLP::new(2600.0, sample_rate),
-            jitter: JitterFilter::new(1600.0, sample_rate, 0.04),
+            antialiasing: ButterworthLP::new(3800.0, sample_rate),
+            jitter: JitterFilter::new(10000.0, sample_rate, 0.10),
             dc_filter: LowPassFilter::new(10.0, sample_rate),
-            air_noise_lp: ButterworthLP::new(2000.0, sample_rate),
+            air_noise_lp: ButterworthLP::new(2400.0, sample_rate),
             convolution: ConvolutionFilter::from_wav_bytes(IR_WAV_BYTES, sample_rate, 0.01, 2048),
             prev_in: 0.0,
         }
@@ -788,21 +786,21 @@ impl SynthChannel {
     #[inline]
     fn process(&mut self, raw_signal: f32, sample_rate: f32, u01: f32, white_n: f32) -> f32 {
         let aa = self.antialiasing.fast_f(raw_signal);
-        let f_p = (aa - self.prev_in) * sample_rate;
-        self.prev_in = aa;
-
         let f_in = self.jitter.fast_f(aa, u01);
         let f_dc = self.dc_filter.fast_f(f_in);
         let f = f_in - f_dc;
+        let f_p = (f_in - self.prev_in) * sample_rate;
+        self.prev_in = f_in;
 
         let r = self.air_noise_lp.fast_f(white_n);
-        let r_mixed = 0.78 + 0.22 * r;
-        let df_f_mix = 0.012_f32;
+        let r_mixed = 0.15 + 0.85 * r;
+        let df_f_mix = 0.014_f32;
         let mut v_in = f_p * df_f_mix + f * r_mixed * (1.0 - df_f_mix);
         if !v_in.is_finite() || v_in.is_subnormal() {
             v_in = 0.0;
         }
-        self.convolution.fast_f(v_in)
+        let wet = self.convolution.fast_f(v_in);
+        wet * 0.88 + v_in * 0.0014
     }
 }
 
@@ -950,8 +948,8 @@ impl EngineSim {
             collectors,
             delay_filters,
             synth_ch: [SynthChannel::new(sr_safe), SynthChannel::new(sr_safe)],
-            out_antialias_l: ButterworthLP::new(9500.0, sr_safe),
-            out_antialias_r: ButterworthLP::new(9500.0, sr_safe),
+            out_antialias_l: ButterworthLP::new(sr_safe * 0.45, sr_safe),
+            out_antialias_r: ButterworthLP::new(sr_safe * 0.45, sr_safe),
             leveler: LevelingFilter::new(26000.0, 1.9, 1.0e-6),
             rng_state: 0x1357_2468,
             starter_phase: 0.0,
