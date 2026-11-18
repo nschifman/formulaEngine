@@ -40,6 +40,7 @@ const WHEEL_RADIUS_M: f64 = 0.33;
 const CAR_MASS_KG: f64 = 605.0;
 const CAR_CDA: f64 = 1.12;
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BenchMode {
     FreeRev,
@@ -156,6 +157,7 @@ impl Default for SharedControls {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy)]
 pub struct CylinderSnapshot {
     pub local_angle_rad: f64,
@@ -195,6 +197,7 @@ pub struct DynoPoint {
     pub recorded: bool,
 }
 
+#[allow(dead_code)]
 #[derive(Clone)]
 pub struct TelemetrySnapshot {
     pub crank_angle_rad: f64,

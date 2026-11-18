@@ -11,20 +11,26 @@ use crate::sim::{
     TelemetrySnapshot, V_ANGLE_DEG,
 };
 
-// Pure Obsidian Black Industrial Palette (single open-space aesthetic)
+// Pure Obsidian Black Palette
 const BG_CANVAS: Color32 = Color32::from_rgb(5, 6, 8);
-#[inline]
-fn bg_tint() -> Color32 {
-    Color32::from_rgba_unmultiplied(11, 13, 18, 215)
-}
-const BG_PILL: Color32 = Color32::from_rgb(15, 18, 24);
-const BORDER_SUBTLE: Color32 = Color32::from_rgb(30, 35, 44);
+const BG_PILL: Color32 = Color32::from_rgb(14, 17, 23);
+const BORDER_SUBTLE: Color32 = Color32::from_rgb(28, 33, 42);
 const TEXT_PRIMARY: Color32 = Color32::from_rgb(228, 232, 240);
-const TEXT_MUTED: Color32 = Color32::from_rgb(122, 130, 146);
+const TEXT_MUTED: Color32 = Color32::from_rgb(118, 126, 142);
 const ACCENT_GREEN: Color32 = Color32::from_rgb(72, 188, 120);
 const ACCENT_AMBER: Color32 = Color32::from_rgb(222, 158, 62);
 const ACCENT_RED: Color32 = Color32::from_rgb(212, 74, 74);
 const ACCENT_CYAN: Color32 = Color32::from_rgb(92, 180, 230);
+
+#[inline]
+fn bg_card() -> Color32 {
+    Color32::from_rgba_unmultiplied(10, 12, 17, 205)
+}
+
+#[inline]
+fn bg_popover() -> Color32 {
+    Color32::from_rgba_unmultiplied(12, 15, 21, 242)
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DiagnosticPlot {
@@ -47,7 +53,7 @@ pub struct FormulaApp {
     controls: Arc<Mutex<SharedControls>>,
     telemetry: Arc<Mutex<TelemetrySnapshot>>,
     diag_plot: DiagnosticPlot,
-    show_ecu_drawer: bool,
+    menu_open: bool,
     visuals_applied: bool,
     space_was_down: bool,
 
@@ -73,7 +79,7 @@ impl FormulaApp {
             controls,
             telemetry,
             diag_plot: DiagnosticPlot::PvDiagram,
-            show_ecu_drawer: false,
+            menu_open: false,
             visuals_applied: false,
             space_was_down: false,
             cam_yaw: -0.62,
@@ -101,9 +107,9 @@ impl FormulaApp {
         style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, BORDER_SUBTLE);
         style.visuals.widgets.inactive.bg_fill = BG_PILL;
         style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, BORDER_SUBTLE);
-        style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(26, 31, 40);
+        style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(24, 29, 38);
         style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, Color32::from_rgb(56, 65, 82));
-        style.visuals.widgets.active.bg_fill = Color32::from_rgb(36, 43, 56);
+        style.visuals.widgets.active.bg_fill = Color32::from_rgb(34, 41, 54);
         style.visuals.selection.bg_fill = Color32::from_rgb(28, 66, 48);
         style.visuals.selection.stroke = Stroke::new(1.0_f32, ACCENT_GREEN);
         style.spacing.item_spacing = Vec2::new(6.0, 4.0);
@@ -164,21 +170,19 @@ impl eframe::App for FormulaApp {
 
         self.handle_keyboard(ctx, &mut ctrl);
 
-        // Single open obsidian canvas — zero child windows or split panel chrome
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(BG_CANVAS))
             .show(ctx, |ui| {
                 let full_rect = ui.max_rect();
                 let painter = ui.painter_at(full_rect);
 
-                // Subtle open-space floor grid reference (gives 3D orientation cue without boxes)
                 let arena_center = Pos2::new(
-                    full_rect.left() + full_rect.width() * 0.47,
-                    full_rect.top() + full_rect.height() * 0.54,
+                    full_rect.left() + full_rect.width() * 0.45,
+                    full_rect.top() + full_rect.height() * 0.55,
                 );
-                let arena_scale_base = (full_rect.height() * 0.86).min(full_rect.width() * 0.58);
+                let arena_scale_base = (full_rect.height() * 0.88).min(full_rect.width() * 0.58);
 
-                // 1. CAMERA INPUT (Middle Mouse Click Drag to Orbit + Wheel Zoom)
+                // 1. CAMERA ORBIT (Middle Mouse Button Drag + Secondary Fallback + Wheel Zoom)
                 ctx.input(|i| {
                     let mmb_or_rmb = i.pointer.button_down(egui::PointerButton::Middle)
                         || i.pointer.button_down(egui::PointerButton::Secondary);
@@ -199,65 +203,83 @@ impl eframe::App for FormulaApp {
                     }
                 });
 
-                // 2. BUILD & DEPTH-SORT 3D V10 SCENE
+                // 2. HUD LAYOUT RECTS
+                let throttle_h = (full_rect.height() * 0.44).clamp(240.0, 380.0);
+                let throttle_top = full_rect.center().y - throttle_h * 0.52;
+                let throttle_bar_rect =
+                    Rect::from_min_size(Pos2::new(full_rect.left() + 28.0, throttle_top), Vec2::new(24.0, throttle_h));
+                let throttle_hit_rect = throttle_bar_rect.expand2(Vec2::new(14.0, 10.0));
+
+                let hamburger_btn_rect = Rect::from_min_size(
+                    Pos2::new(full_rect.left() + 26.0, full_rect.bottom() - 48.0),
+                    Vec2::new(186.0, 32.0),
+                );
+                let popover_rect = Rect::from_min_size(
+                    Pos2::new(full_rect.left() + 26.0, hamburger_btn_rect.top() - 252.0),
+                    Vec2::new(224.0, 244.0),
+                );
+
+                let right_w = 312.0_f32;
+                let right_hud_rect = Rect::from_min_max(
+                    Pos2::new(full_rect.right() - right_w - 18.0, full_rect.top() + 80.0),
+                    Pos2::new(full_rect.right() - 18.0, full_rect.bottom() - 22.0),
+                );
+
+                let pointer_pos = ctx.input(|i| i.pointer.interact_pos());
+                let hover_pos = ctx.input(|i| i.pointer.hover_pos());
+                let menu_was_open = self.menu_open;
+                let pos_over_hud = |p: Pos2| {
+                    throttle_hit_rect.contains(p)
+                        || hamburger_btn_rect.contains(p)
+                        || (menu_was_open && popover_rect.contains(p))
+                        || right_hud_rect.contains(p)
+                };
+
+                // 3. BUILD & RENDER LOW-POLY 3D V10 (first pass projects hit targets for hover highlights)
                 let cam = Camera3D::new(
                     arena_center,
                     arena_scale_base * self.cam_zoom,
                     self.cam_yaw,
                     self.cam_pitch,
                 );
+
+                // Compute hover hit from last known target geometry during interaction after build:
+                // We build with tentative active_highlight, then interact cleanly below.
                 let mut scene = Scene3D::default();
-                let hits = build_v10_scene_3d(&cam, &mut scene, &snap, &ctrl);
+                let pre_highlight = if self.active_drag_part != EnginePart::None {
+                    self.active_drag_part
+                } else {
+                    EnginePart::None
+                };
+                let hits = build_v10_scene_3d(&cam, &mut scene, &snap, &ctrl, pre_highlight);
+
+                let hovered_part = hover_pos
+                    .filter(|p| !pos_over_hud(*p))
+                    .map(|p| hits.hit_test(p))
+                    .unwrap_or(EnginePart::None);
+                let active_highlight = if self.active_drag_part != EnginePart::None {
+                    self.active_drag_part
+                } else {
+                    hovered_part
+                };
+
+                // Re-shade cleanly if hovering an interactive 3D part so the part glows cleanly
+                if hovered_part != EnginePart::None && hovered_part != pre_highlight {
+                    scene.items.clear();
+                    let _ = build_v10_scene_3d(&cam, &mut scene, &snap, &ctrl, active_highlight);
+                }
                 scene.render(&painter);
 
-                // 3. HUD RECTS (explicitly excluded from 3D engine click-through)
-                let tl_hud_rect = Rect::from_min_size(
-                    Pos2::new(full_rect.left() + 24.0, full_rect.top() + 14.0),
-                    Vec2::new(340.0, 56.0),
-                );
-                let throttle_bar_rect = Rect::from_min_size(
-                    Pos2::new(full_rect.left() + 26.0, full_rect.top() + 104.0),
-                    Vec2::new(26.0, (full_rect.height() - 390.0).clamp(210.0, 360.0)),
-                );
-                let throttle_hit_rect = throttle_bar_rect.expand2(Vec2::new(14.0, 10.0));
-                let bottom_left_rect = Rect::from_min_max(
-                    Pos2::new(full_rect.left() + 24.0, throttle_bar_rect.bottom() + 24.0),
-                    Pos2::new(full_rect.left() + 275.0, full_rect.bottom() - 34.0),
-                );
-                let right_hud_rect = Rect::from_min_max(
-                    Pos2::new(full_rect.right() - 306.0, full_rect.top() + 86.0),
-                    Pos2::new(full_rect.right() - 18.0, full_rect.bottom() - 30.0),
-                );
-
-                // Clamp 3D callout tags inside the open center space so they never collide with HUDs
-                let arena_tag_bounds = Rect::from_min_max(
-                    Pos2::new(full_rect.left() + 260.0, full_rect.top() + 88.0),
-                    Pos2::new(full_rect.right() - 325.0, full_rect.bottom() - 48.0),
-                );
-                let mut hits = hits;
-                hits.clamp_tags(arena_tag_bounds);
-
-                // LEFT-CLICK 3D ENGINE INTERACTION LAYER
+                // 4. DIRECT 3D ENGINE INTERACTION LAYER
                 let engine_resp = ui.interact(
                     full_rect,
                     ui.id().with("engine_3d_space"),
                     Sense::click_and_drag(),
                 );
-                let pointer_pos = ctx.input(|i| i.pointer.interact_pos());
-                let hover_pos = ctx.input(|i| i.pointer.hover_pos());
-                let pos_over_hud = |p: Pos2| {
-                    tl_hud_rect.contains(p)
-                        || throttle_hit_rect.contains(p)
-                        || bottom_left_rect.contains(p)
-                        || right_hud_rect.contains(p)
-                };
-                let hovered_part = hover_pos
-                    .filter(|p| !pos_over_hud(*p))
-                    .map(|p| hits.hit_test(p))
-                    .unwrap_or(EnginePart::None);
 
                 if engine_resp.drag_started_by(egui::PointerButton::Primary) {
                     if let Some(pos) = pointer_pos.filter(|p| !pos_over_hud(*p)) {
+                        self.menu_open = false;
                         let part = hits.hit_test(pos);
                         self.active_drag_part = part;
                         if part == EnginePart::FlywheelHandCrank {
@@ -301,6 +323,7 @@ impl eframe::App for FormulaApp {
 
                 if engine_resp.clicked() {
                     if let Some(pos) = pointer_pos.filter(|p| !pos_over_hud(*p)) {
+                        self.menu_open = false;
                         match hits.hit_test(pos) {
                             EnginePart::CylinderBlock => ctrl.set_preheat(!ctrl.preheat_on()),
                             EnginePart::PneumaticHeads => ctrl.toggle_pneumatics(),
@@ -310,7 +333,6 @@ impl eframe::App for FormulaApp {
                     }
                 }
 
-                // Holding primary pointer button down over Rear Starter engages Air Starter
                 let mut starter_down = self.holding_starter;
                 if engine_resp.is_pointer_button_down_on()
                     && ctx.input(|i| i.pointer.primary_down())
@@ -322,14 +344,7 @@ impl eframe::App for FormulaApp {
                         }
                     }
                 }
-
-                // Draw 3D Callout Tags directly anchored to the 3D engine parts
-                let active_highlight = if self.active_drag_part != EnginePart::None {
-                    self.active_drag_part
-                } else {
-                    hovered_part
-                };
-                draw_3d_callout_tags(&painter, &hits, &snap, &ctrl, active_highlight, starter_down);
+                ctrl.starter_active = starter_down;
 
                 if self.orbiting {
                     ctx.set_cursor_icon(CursorIcon::Grabbing);
@@ -345,10 +360,10 @@ impl eframe::App for FormulaApp {
                     });
                 }
 
-                // 4. TOP OPEN-SPACE TELEMETRY & SHIFT LIGHTS
-                draw_top_hud(ui, &painter, full_rect, tl_hud_rect, &snap, &mut ctrl, &mut self.cam_yaw, &mut self.cam_pitch, &mut self.cam_zoom);
+                // 5. TOP OPEN-SPACE TACHOMETER & SHIFT LIGHTS (clean, buttonless top bar)
+                draw_top_hud(ui, &painter, full_rect, &snap, &ctrl);
 
-                // 5. LEFT-SIDE VERTICAL THROTTLE SLIDER + KEYBIND MARKINGS
+                // 6. LEFT VERTICAL THROTTLE SLIDER + KEYBIND MARKINGS
                 draw_vertical_throttle_slider(
                     ui,
                     &painter,
@@ -359,49 +374,25 @@ impl eframe::App for FormulaApp {
                     &mut self.dragging_throttle_bar,
                 );
 
-                // 6. BOTTOM-LEFT COMPACT STARTUP FLOW + TEST MODE PILLS
-                let pill_starter =
-                    draw_bottom_left_hud(ui, bottom_left_rect, &snap, &mut ctrl, &mut self.show_ecu_drawer);
-                ctrl.starter_active = starter_down || pill_starter;
-
-                // 7. RIGHT-SIDE OPEN-SPACE DIAGNOSTICS (DYNO + P-V/SCOPE + VITALS)
+                // 7. RIGHT-SIDE CLEAN TELEMETRY GRAPHS
                 draw_right_hud(ui, right_hud_rect, &snap, &mut ctrl, &mut self.diag_plot);
 
-                // 8. BOTTOM-CENTER SUBTLE INTERACTION FOOTER
-                let footer_hint = match active_highlight {
-                    EnginePart::CylinderBlock => {
-                        "3D Cylinder Block Pre-Heater — Click to toggle Pre-Heat (22°C -> 60°C)"
-                    }
-                    EnginePart::PneumaticHeads => {
-                        "3D N2 Pneumatic Bottle & Heads — Click to pressurize valve springs (165 bar)"
-                    }
-                    EnginePart::SparkPlugs => {
-                        "3D V-Valley Fuel Rail & Coils — Click to arm Fuel & Ignition"
-                    }
-                    EnginePart::CrankHubStarter => {
-                        "3D Rear Air Starter Drive — Click & Hold to crank the V10"
-                    }
-                    EnginePart::IntakeTrumpets => {
-                        "3D Variable Intake Trumpets — Drag Up/Down to open throttle butterflies"
-                    }
-                    EnginePart::FlywheelHandCrank => {
-                        if snap.rpm < 60.0 {
-                            "3D Front Crank Pulley — Drag around center to bar engine over by hand"
-                        } else {
-                            "3D Front Crank Pulley — Rotating at engine speed"
-                        }
-                    }
-                    EnginePart::None => {
-                        "Middle Mouse Drag: Orbit 3D V10  •  Scroll: Zoom  •  Click 3D Parts (1->2->3->4) to Start  •  [R] Reset View"
-                    }
-                };
-                painter.text(
-                    Pos2::new(arena_center.x, full_rect.bottom() - 12.0),
-                    Align2::CENTER_BOTTOM,
-                    footer_hint,
-                    FontId::monospace(10.0),
-                    TEXT_MUTED,
+                // 8. BOTTOM-LEFT HAMBURGER MENU (Manual Rev, Auto Pull, Monza Lap, 7-Spd, Audio, Utilities)
+                draw_bottom_hamburger_menu(
+                    ui,
+                    &painter,
+                    hamburger_btn_rect,
+                    popover_rect,
+                    &snap,
+                    &mut ctrl,
+                    &mut self.menu_open,
+                    &mut self.cam_yaw,
+                    &mut self.cam_pitch,
+                    &mut self.cam_zoom,
                 );
+
+                // 9. SINGLE CLEAN BOTTOM-CENTER INTERACTIVE GUIDE / PART PROMPT
+                draw_footer_prompt(&painter, arena_center.x, full_rect.bottom() - 14.0, &snap, &ctrl, active_highlight);
             });
 
         *self.controls.lock().unwrap() = ctrl;
@@ -409,7 +400,7 @@ impl eframe::App for FormulaApp {
 }
 
 // ============================================================================
-// 3D CAMERA & DEPTH-SORTED VECTOR RENDERER
+// 3D CAMERA & ARTIFACT-FREE LOW-POLY RENDERER
 // ============================================================================
 
 struct Camera3D {
@@ -429,10 +420,8 @@ impl Camera3D {
         let cp = pitch.cos();
         let sp = pitch.sin();
 
-        // Forward vector looking from camera toward target
         let fwd = [-sy * cp, -sp, cy * cp];
         let right = [cy, 0.0, sy];
-        // up = fwd x right (screen +Y points down, so negate world Y sign when mapping to Pos2)
         let up = [
             fwd[1] * right[2] - fwd[2] * right[1],
             fwd[2] * right[0] - fwd[0] * right[2],
@@ -446,7 +435,7 @@ impl Camera3D {
             right,
             up,
             fwd,
-            target: [0.0, 0.14, 0.0],
+            target: [0.0, 0.13, 0.0],
         }
     }
 
@@ -460,12 +449,15 @@ impl Camera3D {
         let x_cam = rel[0] * self.right[0] + rel[1] * self.right[1] + rel[2] * self.right[2];
         let y_cam = rel[0] * self.up[0] + rel[1] * self.up[1] + rel[2] * self.up[2];
         let z_cam = self.cam_dist + (rel[0] * self.fwd[0] + rel[1] * self.fwd[1] + rel[2] * self.fwd[2]);
-        if z_cam < 0.25 {
+        if z_cam < 0.35 {
             return None;
         }
         let persp = self.scale_px / z_cam;
         let sx = self.origin_2d.x + x_cam * persp;
         let sy = self.origin_2d.y - y_cam * persp;
+        if !sx.is_finite() || !sy.is_finite() || sx.abs() > 8000.0 || sy.abs() > 8000.0 {
+            return None;
+        }
         Some((Pos2::new(sx, sy), z_cam, persp))
     }
 }
@@ -497,11 +489,24 @@ fn norm3(a: [f32; 3]) -> [f32; 3] {
 }
 
 #[inline]
+fn tint_mix(a: Color32, b: Color32, t: f32) -> Color32 {
+    let u = t.clamp(0.0, 1.0);
+    Color32::from_rgba_unmultiplied(
+        ((a.r() as f32) * (1.0 - u) + (b.r() as f32) * u) as u8,
+        ((a.g() as f32) * (1.0 - u) + (b.g() as f32) * u) as u8,
+        ((a.b() as f32) * (1.0 - u) + (b.b() as f32) * u) as u8,
+        a.a(),
+    )
+}
+
+#[inline]
 fn shade_color(base: Color32, normal: [f32; 3]) -> Color32 {
-    let l = norm3([-0.35, 0.85, -0.40]);
+    let key = norm3([-0.38, 0.86, -0.34]);
+    let rim = norm3([0.55, -0.30, 0.78]);
     let n = norm3(normal);
-    let ndotl = dot3(n, l).abs();
-    let gain = 0.56 + 0.44 * ndotl;
+    let k = dot3(n, key).abs();
+    let r = dot3(n, rim).abs();
+    let gain = 0.50 + 0.44 * k + 0.14 * r;
     Color32::from_rgba_unmultiplied(
         ((base.r() as f32 * gain).min(255.0)) as u8,
         ((base.g() as f32 * gain).min(255.0)) as u8,
@@ -514,7 +519,6 @@ enum Prim3D {
     Poly {
         pts: Vec<Pos2>,
         fill: Color32,
-        stroke: Stroke,
     },
     Line {
         a: Pos2,
@@ -525,7 +529,6 @@ enum Prim3D {
         c: Pos2,
         r: f32,
         fill: Color32,
-        stroke: Stroke,
     },
 }
 
@@ -540,8 +543,13 @@ struct Scene3D {
 }
 
 impl Scene3D {
-    fn push_poly(&mut self, cam: &Camera3D, world_pts: &[[f32; 3]], fill: Color32, stroke: Stroke, shade: bool) {
-        let mut pts = Vec::with_capacity(world_pts.len());
+    /// Push a strokeless, winding-normalized 3D convex polygon (eliminates epaint miter/feather spikes)
+    fn push_poly(&mut self, cam: &Camera3D, world_pts: &[[f32; 3]], fill: Color32, shade: bool) {
+        let n_verts = world_pts.len();
+        if n_verts < 3 {
+            return;
+        }
+        let mut pts = Vec::with_capacity(n_verts);
         let mut depth_sum = 0.0_f32;
         for &wp in world_pts {
             if let Some((p2, z, _)) = cam.project(wp) {
@@ -551,7 +559,22 @@ impl Scene3D {
                 return;
             }
         }
-        let final_fill = if shade && world_pts.len() >= 3 {
+
+        // Signed 2D area & edge-length guard: cull near-collinear slivers and enforce CCW winding
+        let mut area2 = 0.0_f32;
+        for i in 0..n_verts {
+            let a = pts[i];
+            let b = pts[(i + 1) % n_verts];
+            area2 += a.x * b.y - b.x * a.y;
+        }
+        if area2.abs() < 2.2 {
+            return;
+        }
+        if area2 < 0.0 {
+            pts.reverse();
+        }
+
+        let final_fill = if shade {
             let e1 = sub3(world_pts[1], world_pts[0]);
             let e2 = sub3(world_pts[2], world_pts[0]);
             let n = [
@@ -563,55 +586,86 @@ impl Scene3D {
         } else {
             fill
         };
+
         self.items.push(DrawItem3D {
-            depth: depth_sum / world_pts.len() as f32,
-            prim: Prim3D::Poly {
-                pts,
-                fill: final_fill,
-                stroke,
-            },
+            depth: depth_sum / n_verts as f32,
+            prim: Prim3D::Poly { pts, fill: final_fill },
         });
     }
 
+    fn push_box_3d(
+        &mut self,
+        cam: &Camera3D,
+        center: [f32; 3],
+        ax_x: [f32; 3],
+        ax_y: [f32; 3],
+        ax_z: [f32; 3],
+        hx: f32,
+        hy: f32,
+        hz: f32,
+        fill: Color32,
+    ) {
+        let vx = mul3(ax_x, hx);
+        let vy = mul3(ax_y, hy);
+        let vz = mul3(ax_z, hz);
+
+        let p000 = sub3(sub3(sub3(center, vx), vy), vz);
+        let p100 = sub3(sub3(add3(center, vx), vy), vz);
+        let p110 = sub3(add3(add3(center, vx), vy), vz);
+        let p010 = sub3(add3(sub3(center, vx), vy), vz);
+        let p001 = add3(sub3(sub3(center, vx), vy), vz);
+        let p101 = add3(sub3(add3(center, vx), vy), vz);
+        let p111 = add3(add3(add3(center, vx), vy), vz);
+        let p011 = add3(add3(sub3(center, vx), vy), vz);
+
+        let faces = [
+            [p000, p100, p110, p010], // -z
+            [p001, p011, p111, p101], // +z
+            [p000, p010, p011, p001], // -x
+            [p100, p101, p111, p110], // +x
+            [p000, p001, p101, p100], // -y
+            [p010, p110, p111, p011], // +y
+        ];
+        for f in &faces {
+            self.push_poly(cam, f, fill, true);
+        }
+    }
+
+    /// 3D shaded segment rendered safely (falls back to disc cap when viewed head-on to avoid line normal glitches)
     fn push_rod(&mut self, cam: &Camera3D, a_w: [f32; 3], b_w: [f32; 3], radius_m: f32, col: Color32) {
         if let (Some((pa, za, s_a)), Some((pb, zb, s_b))) = (cam.project(a_w), cam.project(b_w)) {
-            let px_w = (radius_m * 2.0 * 0.5 * (s_a + s_b)).clamp(1.2, 34.0);
-            self.items.push(DrawItem3D {
-                depth: 0.5 * (za + zb),
-                prim: Prim3D::Line {
-                    a: pa,
-                    b: pb,
-                    stroke: Stroke::new(px_w, col),
-                },
-            });
+            let r_px = (radius_m * 0.5 * (s_a + s_b)).clamp(0.7, 14.0);
+            let len_sq = (pb - pa).length_sq();
+            if len_sq < 1.5 {
+                self.items.push(DrawItem3D {
+                    depth: 0.5 * (za + zb),
+                    prim: Prim3D::Circle { c: pa, r: r_px, fill: col },
+                });
+            } else {
+                self.items.push(DrawItem3D {
+                    depth: 0.5 * (za + zb),
+                    prim: Prim3D::Line {
+                        a: pa,
+                        b: pb,
+                        stroke: Stroke::new(r_px * 2.0, col),
+                    },
+                });
+            }
         }
     }
 
-    fn push_line(&mut self, cam: &Camera3D, a_w: [f32; 3], b_w: [f32; 3], stroke: Stroke) {
+    fn push_line_3d(&mut self, cam: &Camera3D, a_w: [f32; 3], b_w: [f32; 3], stroke: Stroke) {
         if let (Some((pa, za, _)), Some((pb, zb, _))) = (cam.project(a_w), cam.project(b_w)) {
-            self.items.push(DrawItem3D {
-                depth: 0.5 * (za + zb),
-                prim: Prim3D::Line { a: pa, b: pb, stroke },
-            });
+            if (pb - pa).length_sq() >= 1.2 {
+                self.items.push(DrawItem3D {
+                    depth: 0.5 * (za + zb),
+                    prim: Prim3D::Line { a: pa, b: pb, stroke },
+                });
+            }
         }
     }
 
-    fn push_sphere(&mut self, cam: &Camera3D, c_w: [f32; 3], radius_m: f32, fill: Color32, stroke: Stroke) {
-        if let Some((pc, zc, s)) = cam.project(c_w) {
-            self.items.push(DrawItem3D {
-                depth: zc,
-                prim: Prim3D::Circle {
-                    c: pc,
-                    r: (radius_m * s).clamp(1.5, 42.0),
-                    fill,
-                    stroke,
-                },
-            });
-        }
-    }
-
-    /// Push a 3D circular ring/disc oriented perpendicular to axis `axis_u, axis_v`
-    fn push_ring_3d(
+    fn push_disc_3d(
         &mut self,
         cam: &Camera3D,
         center: [f32; 3],
@@ -620,18 +674,20 @@ impl Scene3D {
         radius: f32,
         segs: usize,
         fill: Color32,
-        stroke: Stroke,
+        shade: bool,
     ) {
         let mut pts = Vec::with_capacity(segs);
         for k in 0..segs {
             let a = (k as f32 / segs as f32) * 2.0 * PI;
-            let wp = add3(center, add3(mul3(u_dir, a.cos() * radius), mul3(v_dir, a.sin() * radius)));
-            pts.push(wp);
+            pts.push(add3(
+                center,
+                add3(mul3(u_dir, a.cos() * radius), mul3(v_dir, a.sin() * radius)),
+            ));
         }
-        self.push_poly(cam, &pts, fill, stroke, false);
+        self.push_poly(cam, &pts, fill, shade);
     }
 
-    fn push_cylinder_shell(
+    fn push_cylinder_3d(
         &mut self,
         cam: &Camera3D,
         p0: [f32; 3],
@@ -642,7 +698,7 @@ impl Scene3D {
         r1: f32,
         segs: usize,
         fill: Color32,
-        stroke: Stroke,
+        cap_ends: bool,
         shade: bool,
     ) {
         for k in 0..segs {
@@ -656,7 +712,24 @@ impl Scene3D {
                 add3(p1, mul3(n1, r1)),
                 add3(p0, mul3(n1, r0)),
             ];
-            self.push_poly(cam, &q, fill, stroke, shade);
+            self.push_poly(cam, &q, fill, shade);
+        }
+        if cap_ends {
+            self.push_disc_3d(cam, p0, u_dir, v_dir, r0, segs, fill, shade);
+            self.push_disc_3d(cam, p1, u_dir, v_dir, r1, segs, fill, shade);
+        }
+    }
+
+    fn push_spark(&mut self, cam: &Camera3D, c_w: [f32; 3], radius_m: f32, fill: Color32) {
+        if let Some((pc, zc, s)) = cam.project(c_w) {
+            self.items.push(DrawItem3D {
+                depth: zc,
+                prim: Prim3D::Circle {
+                    c: pc,
+                    r: (radius_m * s).clamp(2.0, 26.0),
+                    fill,
+                },
+            });
         }
     }
 
@@ -665,19 +738,14 @@ impl Scene3D {
             .sort_by(|a, b| b.depth.partial_cmp(&a.depth).unwrap_or(std::cmp::Ordering::Equal));
         for item in &self.items {
             match &item.prim {
-                Prim3D::Poly { pts, fill, stroke } => {
-                    p.add(egui::Shape::convex_polygon(pts.clone(), *fill, *stroke));
+                Prim3D::Poly { pts, fill } => {
+                    p.add(egui::Shape::convex_polygon(pts.clone(), *fill, Stroke::NONE));
                 }
                 Prim3D::Line { a, b, stroke } => {
                     p.line_segment([*a, *b], *stroke);
                 }
-                Prim3D::Circle { c, r, fill, stroke } => {
-                    if *fill != Color32::TRANSPARENT {
-                        p.circle_filled(*c, *r, *fill);
-                    }
-                    if stroke.width > 0.0 && stroke.color != Color32::TRANSPARENT {
-                        p.circle_stroke(*c, *r, *stroke);
-                    }
+                Prim3D::Circle { c, r, fill } => {
+                    p.circle_filled(*c, *r, *fill);
                 }
             }
         }
@@ -691,41 +759,14 @@ struct HitTargets3D {
     starter_pos: Pos2,
     front_pulley_pos: Pos2,
     trumpet_pts: Vec<Pos2>,
-    tag_preheat: Rect,
-    tag_n2: Rect,
-    tag_rail: Rect,
-    tag_starter: Rect,
 }
 
 impl HitTargets3D {
-    fn clamp_tags(&mut self, bounds: Rect) {
-        let clamp_one = |r: &mut Rect| {
-            let sz = r.size();
-            let half = sz * 0.5;
-            let cx = r.center().x.clamp(bounds.left() + half.x, (bounds.right() - half.x).max(bounds.left() + half.x));
-            let cy = r.center().y.clamp(bounds.top() + half.y, (bounds.bottom() - half.y).max(bounds.top() + half.y));
-            *r = Rect::from_center_size(Pos2::new(cx, cy), sz);
-        };
-        clamp_one(&mut self.tag_preheat);
-        clamp_one(&mut self.tag_n2);
-        clamp_one(&mut self.tag_rail);
-        clamp_one(&mut self.tag_starter);
-    }
-
     fn hit_test(&self, pos: Pos2) -> EnginePart {
-        if self.tag_starter.contains(pos) || (pos - self.starter_pos).length() < 34.0 {
+        if (pos - self.starter_pos).length() < 36.0 {
             return EnginePart::CrankHubStarter;
         }
-        if self.tag_n2.contains(pos) {
-            return EnginePart::PneumaticHeads;
-        }
-        if self.tag_rail.contains(pos) {
-            return EnginePart::SparkPlugs;
-        }
-        if self.tag_preheat.contains(pos) {
-            return EnginePart::CylinderBlock;
-        }
-        if (pos - self.front_pulley_pos).length() < 40.0 {
+        if (pos - self.front_pulley_pos).length() < 38.0 {
             return EnginePart::FlywheelHandCrank;
         }
         for &p in &self.n2_pts {
@@ -734,17 +775,17 @@ impl HitTargets3D {
             }
         }
         for &p in &self.rail_pts {
-            if (pos - p).length() < 22.0 {
+            if (pos - p).length() < 24.0 {
                 return EnginePart::SparkPlugs;
             }
         }
         for &p in &self.trumpet_pts {
-            if (pos - p).length() < 28.0 {
+            if (pos - p).length() < 26.0 {
                 return EnginePart::IntakeTrumpets;
             }
         }
         for &p in &self.preheat_pts {
-            if (pos - p).length() < 32.0 {
+            if (pos - p).length() < 30.0 {
                 return EnginePart::CylinderBlock;
             }
         }
@@ -757,6 +798,7 @@ fn build_v10_scene_3d(
     scene: &mut Scene3D,
     snap: &TelemetrySnapshot,
     ctrl: &SharedControls,
+    highlight: EnginePart,
 ) -> HitTargets3D {
     let bore = BORE_M as f32;
     let r_crank = CRANK_RADIUS_M as f32;
@@ -766,168 +808,253 @@ fn build_v10_scene_3d(
     let throw_spacing = 0.112_f32;
     let z_front = -2.0 * throw_spacing - 0.055;
     let z_rear = 2.0 * throw_spacing + 0.055;
+    let bay_hz = throw_spacing * 0.48;
 
     let tdc_wrist = r_crank + l_rod;
-    let piston_h = bore * 0.30;
-    let crown_offset = piston_h * 0.45;
+    let piston_h = bore * 0.28;
+    let crown_offset = piston_h * 0.46;
     let head_dist = tdc_wrist + crown_offset + stroke * 0.14;
-    let cyl_bot_dist = l_rod - r_crank - piston_h * 0.28;
+    let cyl_bot_dist = l_rod - r_crank - piston_h * 0.26;
     let mid_dist = 0.5 * (head_dist + cyl_bot_dist);
     let trumpet_len_m = (snap.trumpet_length_mm as f32) * 0.001;
+    let min_temp = snap.coolant_temp_c.min(snap.oil_temp_c);
 
-    // 0. Subtle 3D Engine Stand / Floor Reference Crosshairs
-    let floor_y = -0.075_f32;
-    for g in -2..=2 {
-        let off = g as f32 * 0.14;
-        scene.push_line(
+    // 1. Cast Billet Dry-Sump Oil Pan & Lower Bedplate (segmented per bay for accurate Z-depth sorting)
+    for bay in 0..5 {
+        let zb = (bay as f32 - 2.0) * throw_spacing;
+        scene.push_box_3d(
             cam,
-            [off, floor_y, z_front - 0.08],
-            [off, floor_y, z_rear + 0.08],
-            Stroke::new(1.0_f32, Color32::from_rgb(16, 19, 25)),
-        );
-        scene.push_line(
-            cam,
-            [-0.28, floor_y, off * 1.15],
-            [0.28, floor_y, off * 1.15],
-            Stroke::new(1.0_f32, Color32::from_rgb(16, 19, 25)),
-        );
-    }
-
-    // 1. Central Main Bearing Bulkheads & Sump Bedplate
-    for b in 0..=5 {
-        let zb = -2.5 * throw_spacing + (b as f32) * throw_spacing;
-        scene.push_ring_3d(
-            cam,
-            [0.0, 0.0, zb],
+            [0.0, -0.044, zb],
             [1.0, 0.0, 0.0],
             [0.0, 1.0, 0.0],
-            r_crank * 2.15,
-            10,
-            Color32::from_rgba_unmultiplied(18, 21, 28, 175),
-            Stroke::new(1.0_f32, Color32::from_rgb(38, 44, 56)),
+            [0.0, 0.0, 1.0],
+            0.132,
+            0.018,
+            bay_hz,
+            Color32::from_rgb(24, 28, 36),
         );
     }
 
-    // 2. Thermal Block Pre-Heater Manifolds (Left & Right lower crankcase heat rails)
-    let min_temp = snap.coolant_temp_c.min(snap.oil_temp_c);
-    let preheat_col = if min_temp >= 60.0 {
-        Color32::from_rgb(56, 138, 92)
+    // Front & Rear Timing Case Bulkhead Plates
+    for &z_plate in &[z_front, z_rear] {
+        scene.push_box_3d(
+            cam,
+            [0.0, 0.042, z_plate],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            0.125,
+            0.068,
+            0.010,
+            Color32::from_rgb(32, 37, 47),
+        );
+    }
+
+    // Main Crankshaft Core Journal
+    scene.push_cylinder_3d(
+        cam,
+        [0.0, 0.0, z_front - 0.042],
+        [0.0, 0.0, z_rear + 0.042],
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        0.018,
+        0.018,
+        10,
+        Color32::from_rgb(104, 114, 132),
+        false,
+        true,
+    );
+
+    // 2. Lower Block Thermal Pre-Heater Manifolds (Click Step 1)
+    let mut block_col = if min_temp >= 60.0 {
+        Color32::from_rgb(56, 136, 92)
     } else if ctrl.preheat_on() {
-        Color32::from_rgb(205, 132, 46)
+        Color32::from_rgb(208, 132, 46)
     } else {
-        Color32::from_rgb(66, 74, 88)
+        Color32::from_rgb(56, 63, 76)
     };
+    if highlight == EnginePart::CylinderBlock {
+        block_col = tint_mix(block_col, ACCENT_AMBER, 0.45);
+    }
     let mut preheat_pts = Vec::new();
-    for &sign_x in &[-1.0_f32, 1.0_f32] {
-        let hx = sign_x * 0.145;
-        let hy = 0.055;
-        scene.push_rod(cam, [hx, hy, z_front], [hx, hy, z_rear], 0.011, preheat_col);
-        for &z_pt in &[z_front + 0.06, 0.0, z_rear - 0.06] {
-            if let Some((p2, _, _)) = cam.project([hx, hy, z_pt]) {
+    for &sx in &[-1.0_f32, 1.0_f32] {
+        let hx = sx * 0.145;
+        let hy = 0.036;
+        for bay in 0..5 {
+            let zb = (bay as f32 - 2.0) * throw_spacing;
+            scene.push_box_3d(
+                cam,
+                [hx, hy, zb],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+                0.014,
+                0.016,
+                bay_hz,
+                block_col,
+            );
+            if let Some((p2, _, _)) = cam.project([hx, hy, zb]) {
                 preheat_pts.push(p2);
             }
         }
     }
 
-    // 3. Crankshaft Main Axis, 5 Throws, Counterweights, Pistons, Rods, Cylinders, Valves, Trumpets, Exhausts
-    scene.push_rod(
-        cam,
-        [0.0, 0.0, z_front - 0.055],
-        [0.0, 0.0, z_rear + 0.055],
-        0.016,
-        Color32::from_rgb(92, 102, 118),
-    );
-
-    let ex_col = header_glow_color(snap.egt_c);
-    let mut trumpet_pts = Vec::new();
-    let mut rail_pts = Vec::new();
+    // 3. Sculpted Bank Cylinder Head Castings + Pneumatic Cam Covers (Click Step 2)
+    let mut pneu_col = if ctrl.n2_pressure_bar >= 100.0 {
+        Color32::from_rgb(56, 112, 162)
+    } else {
+        Color32::from_rgb(46, 53, 66)
+    };
+    if highlight == EnginePart::PneumaticHeads {
+        pneu_col = tint_mix(pneu_col, ACCENT_CYAN, 0.45);
+    }
     let mut n2_pts = Vec::new();
+    for &bank_ang in &[-half_v, half_v] {
+        let u_axis = [bank_ang.sin(), bank_ang.cos(), 0.0];
+        let u_perp = [bank_ang.cos(), -bank_ang.sin(), 0.0];
+        let u_z = [0.0, 0.0, 1.0];
 
-    // Left & Right 5-into-1 Collector tips
-    let col_tip_l = [-0.285_f32, 0.095_f32, z_rear + 0.04];
-    let col_tip_r = [0.285_f32, 0.095_f32, z_rear + 0.04];
-    scene.push_cylinder_shell(
-        cam,
-        add3(col_tip_l, [0.0, 0.0, -0.05]),
-        add3(col_tip_l, [0.0, 0.0, 0.14]),
-        [1.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0],
-        0.025,
-        0.028,
-        8,
-        ex_col,
-        Stroke::new(1.0_f32, Color32::from_rgb(45, 36, 34)),
-        true,
-    );
-    scene.push_cylinder_shell(
-        cam,
-        add3(col_tip_r, [0.0, 0.0, -0.05]),
-        add3(col_tip_r, [0.0, 0.0, 0.14]),
-        [1.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0],
-        0.025,
-        0.028,
-        8,
-        ex_col,
-        Stroke::new(1.0_f32, Color32::from_rgb(45, 36, 34)),
-        true,
-    );
+        let in_sign = if bank_ang < 0.0 { 1.0 } else { -1.0 };
+        let valley_wall_base = add3(
+            mul3(u_axis, mid_dist),
+            mul3(u_perp, in_sign * bore * 0.56),
+        );
+        let cover_base = mul3(u_axis, head_dist + bore * 0.37);
+        for bay in 0..5 {
+            let zb = (bay as f32 - 2.0) * throw_spacing;
+            scene.push_box_3d(
+                cam,
+                [valley_wall_base[0], valley_wall_base[1], zb],
+                u_perp,
+                u_axis,
+                u_z,
+                0.010,
+                0.5 * (head_dist - cyl_bot_dist),
+                bay_hz,
+                Color32::from_rgb(30, 35, 44),
+            );
+            scene.push_box_3d(
+                cam,
+                [cover_base[0], cover_base[1], zb],
+                u_perp,
+                u_axis,
+                u_z,
+                bore * 0.48,
+                0.016,
+                bay_hz,
+                pneu_col,
+            );
+            if let Some((p2, _, _)) = cam.project([cover_base[0], cover_base[1], zb]) {
+                n2_pts.push(p2);
+            }
+        }
+    }
 
-    let mut bank_head_top_l = [0.0_f32; 3];
-    let mut bank_head_top_r = [0.0_f32; 3];
+    // 4. Longitudinal 5-into-1 Collector Manifolds & Rear Tails
+    let ex_col = header_glow_color(snap.egt_c);
+    let col_z_a = z_front + 0.04;
+    let col_z_b = z_rear + 0.04;
+    for &sx in &[-1.0_f32, 1.0_f32] {
+        let col_x = sx * 0.258;
+        let col_y = 0.128;
+        scene.push_cylinder_3d(
+            cam,
+            [col_x, col_y, col_z_a],
+            [col_x, col_y, col_z_b],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            0.019,
+            0.026,
+            10,
+            ex_col,
+            false,
+            true,
+        );
+        scene.push_cylinder_3d(
+            cam,
+            [col_x, col_y, col_z_b],
+            [col_x * 0.96, col_y - 0.010, col_z_b + 0.135],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            0.026,
+            0.029,
+            12,
+            ex_col,
+            false,
+            true,
+        );
+    }
 
+    // 5. All 10 Cylinders, Pistons, Crank Throws, Conrods, Valves, Trumpets & Primary Headers
+    let mut trumpet_pts = Vec::new();
     for throw_idx in 0..5 {
         let zt = (throw_idx as f32 - 2.0) * throw_spacing;
         let cyl_l_idx = throw_idx;
         let cyl_r_idx = throw_idx + 5;
 
-        // Shared crankpin angle so both Left and Right hit TDC at local_angle_rad == 0
         let pin_angle = (snap.cylinders[cyl_l_idx].local_angle_rad as f32) - half_v;
-        let pin_pos = [pin_angle.sin() * r_crank, pin_angle.cos() * r_crank, zt];
-        let cw_pos = [-pin_angle.sin() * (r_crank * 0.9), -pin_angle.cos() * (r_crank * 0.9), zt];
+        let pin_dir = [pin_angle.sin(), pin_angle.cos(), 0.0];
+        let pin_perp = [pin_angle.cos(), -pin_angle.sin(), 0.0];
+        let pin_pos = [pin_dir[0] * r_crank, pin_dir[1] * r_crank, zt];
 
-        // Crank web & counterweight
-        scene.push_rod(cam, [0.0, 0.0, zt], pin_pos, 0.011, Color32::from_rgb(138, 148, 165));
-        scene.push_sphere(
+        // True 3D Counterweight Web (cylindrical sector opposite crankpin — never billboarded!)
+        let cw_c = [-pin_dir[0] * r_crank * 0.55, -pin_dir[1] * r_crank * 0.55, zt];
+        scene.push_box_3d(
             cam,
-            cw_pos,
-            r_crank * 1.12,
-            Color32::from_rgb(56, 62, 74),
-            Stroke::new(1.0_f32, Color32::from_rgb(88, 96, 112)),
+            cw_c,
+            pin_perp,
+            pin_dir,
+            [0.0, 0.0, 1.0],
+            r_crank * 1.15,
+            r_crank * 0.95,
+            0.011,
+            Color32::from_rgb(54, 60, 72),
         );
-        scene.push_sphere(cam, pin_pos, 0.0085, ACCENT_AMBER, Stroke::NONE);
+        scene.push_rod(cam, [0.0, 0.0, zt], pin_pos, 0.009, Color32::from_rgb(138, 148, 165));
+        scene.push_cylinder_3d(
+            cam,
+            [pin_pos[0], pin_pos[1], zt - 0.018],
+            [pin_pos[0], pin_pos[1], zt + 0.018],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            0.0085,
+            0.0085,
+            8,
+            ACCENT_AMBER,
+            true,
+            true,
+        );
 
-        for &(cyl_idx, bank_ang, col_tip) in &[
-            (cyl_l_idx, -half_v, col_tip_l),
-            (cyl_r_idx, half_v, col_tip_r),
+        for &(cyl_idx, bank_ang, ex_bank_x) in &[
+            (cyl_l_idx, -half_v, -0.258_f32),
+            (cyl_r_idx, half_v, 0.258_f32),
         ] {
             let cyl = &snap.cylinders[cyl_idx];
-            // Offset Left slightly forward and Right slightly aft within each shared throw bay
             let z_cyl = zt + if bank_ang < 0.0 { -0.012 } else { 0.012 };
             let u_axis = [bank_ang.sin(), bank_ang.cos(), 0.0];
             let u_perp = [bank_ang.cos(), -bank_ang.sin(), 0.0];
             let u_z = [0.0, 0.0, 1.0];
 
-            // Kinematic slider-crank wrist pin along cylinder axis in XY
+            // Kinematic slider-crank wrist pin
             let d = [pin_pos[0], pin_pos[1], 0.0];
             let proj = dot3(d, u_axis);
             let perp = dot3(d, u_perp);
             let wrist_dist = proj + (l_rod * l_rod - perp * perp).max(0.0001).sqrt();
             let wrist_pos = add3([0.0, 0.0, z_cyl], mul3(u_axis, wrist_dist));
 
-            // 3D Titanium Conrod
+            // Titanium Conrod
             scene.push_rod(
                 cam,
                 [pin_pos[0], pin_pos[1], z_cyl],
                 wrist_pos,
-                0.0075,
-                Color32::from_rgb(142, 152, 168),
+                0.0068,
+                Color32::from_rgb(144, 154, 170),
             );
 
-            // 3D Billet Piston Crown + Skirt
+            // Low-Poly 12-Facet Forged Piston
             let crown_dist = wrist_dist + crown_offset;
             let skirt_dist = wrist_dist - piston_h * 0.45;
-            scene.push_cylinder_shell(
+            scene.push_cylinder_3d(
                 cam,
                 add3([0.0, 0.0, z_cyl], mul3(u_axis, skirt_dist)),
                 add3([0.0, 0.0, z_cyl], mul3(u_axis, crown_dist)),
@@ -935,76 +1062,41 @@ fn build_v10_scene_3d(
                 u_z,
                 bore * 0.45,
                 bore * 0.45,
-                8,
-                Color32::from_rgb(172, 180, 194),
-                Stroke::new(0.8_f32, Color32::from_rgb(100, 108, 122)),
+                12,
+                Color32::from_rgb(172, 180, 196),
+                true,
                 true,
             );
-            scene.push_ring_3d(
-                cam,
-                add3([0.0, 0.0, z_cyl], mul3(u_axis, crown_dist)),
-                u_perp,
-                u_z,
-                bore * 0.45,
-                8,
-                Color32::from_rgb(198, 206, 218),
-                Stroke::new(0.9_f32, Color32::from_rgb(125, 134, 148)),
-            );
 
-            // 3D Combustion Gas Chamber Volume above Piston Crown
-            if head_dist > crown_dist + 0.001 {
+            // Combustion Gas Charge Cylinder
+            if head_dist > crown_dist + 0.0015 {
                 let g_col = gas_color(cyl);
-                scene.push_cylinder_shell(
+                scene.push_cylinder_3d(
                     cam,
                     add3([0.0, 0.0, z_cyl], mul3(u_axis, crown_dist)),
                     add3([0.0, 0.0, z_cyl], mul3(u_axis, head_dist)),
                     u_perp,
                     u_z,
-                    bore * 0.44,
-                    bore * 0.44,
-                    8,
+                    bore * 0.43,
+                    bore * 0.43,
+                    12,
                     g_col,
-                    Stroke::NONE,
+                    false,
                     false,
                 );
             }
 
-            // 3D Translucent Cylinder Liner Sleeve (cutaway glass-metallic liner so piston/gas remain visible)
-            let sleeve_col = if ctrl.preheat_on() && min_temp < 60.0 {
-                Color32::from_rgb(145, 96, 40)
+            // Cutaway Translucent Cylinder Sleeve (2 axial bands for clean depth sorting around pistons)
+            let sleeve_col = if highlight == EnginePart::CylinderBlock {
+                Color32::from_rgba_unmultiplied(210, 148, 68, 52)
             } else {
-                Color32::from_rgb(54, 62, 76)
+                Color32::from_rgba_unmultiplied(62, 74, 94, 34)
             };
-            scene.push_ring_3d(
-                cam,
-                add3([0.0, 0.0, z_cyl], mul3(u_axis, cyl_bot_dist)),
-                u_perp,
-                u_z,
-                bore * 0.49,
-                10,
-                Color32::from_rgba_unmultiplied(18, 22, 29, 45),
-                Stroke::new(1.0_f32, sleeve_col),
-            );
-            scene.push_ring_3d(
-                cam,
-                add3([0.0, 0.0, z_cyl], mul3(u_axis, head_dist)),
-                u_perp,
-                u_z,
-                bore * 0.49,
-                10,
-                Color32::from_rgba_unmultiplied(24, 28, 36, 55),
-                Stroke::new(1.2_f32, sleeve_col),
-            );
-            // Vertical cutaway liner struts (4 corners)
-            for &sa in &[0.0_f32, PI * 0.5, PI, PI * 1.5] {
-                let off = add3(mul3(u_perp, sa.cos() * bore * 0.49), mul3(u_z, sa.sin() * bore * 0.49));
-                scene.push_line(
-                    cam,
-                    add3(add3([0.0, 0.0, z_cyl], mul3(u_axis, cyl_bot_dist)), off),
-                    add3(add3([0.0, 0.0, z_cyl], mul3(u_axis, head_dist)), off),
-                    Stroke::new(0.8_f32, Color32::from_rgba_unmultiplied(74, 84, 102, 130)),
-                );
-            }
+            let sleeve_c0 = add3([0.0, 0.0, z_cyl], mul3(u_axis, cyl_bot_dist));
+            let sleeve_mid = add3([0.0, 0.0, z_cyl], mul3(u_axis, mid_dist));
+            let sleeve_c1 = add3([0.0, 0.0, z_cyl], mul3(u_axis, head_dist));
+            scene.push_cylinder_3d(cam, sleeve_c0, sleeve_mid, u_perp, u_z, bore * 0.49, bore * 0.49, 12, sleeve_col, false, false);
+            scene.push_cylinder_3d(cam, sleeve_mid, sleeve_c1, u_perp, u_z, bore * 0.49, bore * 0.49, 12, sleeve_col, false, false);
 
             let head_c = add3([0.0, 0.0, z_cyl], mul3(u_axis, head_dist));
             let block_mid = add3([0.0, 0.0, z_cyl], mul3(u_axis, mid_dist));
@@ -1012,290 +1104,244 @@ fn build_v10_scene_3d(
                 preheat_pts.push(p2);
             }
 
-            // Intake & Exhaust Valve Directions (V-inward vs V-outward)
+            // Valves (2 intake + 2 exhaust)
             let in_sign = if bank_ang < 0.0 { 1.0 } else { -1.0 };
             let ex_sign = -in_sign;
             let in_port = add3(head_c, mul3(u_perp, in_sign * bore * 0.22));
             let ex_port = add3(head_c, mul3(u_perp, ex_sign * bore * 0.22));
 
-            // 4 Valves per cylinder (front/rear valve pair on intake & exhaust side)
             let in_travel = (cyl.intake_lift_norm as f32) * (bore * 0.14);
             let ex_travel = (cyl.exhaust_lift_norm as f32) * (bore * 0.14);
-            let valve_head_col_in = Color32::from_rgb(130, 200, 245);
-            let valve_head_col_ex = Color32::from_rgb(240, 140, 95);
             for &vz in &[-bore * 0.16, bore * 0.16] {
                 let seat_in = add3(add3(in_port, [0.0, 0.0, vz]), mul3(u_axis, -in_travel));
-                let stem_in = add3(seat_in, mul3(u_axis, bore * 0.32));
-                scene.push_rod(cam, seat_in, stem_in, 0.0024, valve_head_col_in);
-                scene.push_sphere(cam, seat_in, 0.009, valve_head_col_in, Stroke::NONE);
+                let stem_in = add3(seat_in, mul3(u_axis, bore * 0.30));
+                scene.push_rod(cam, seat_in, stem_in, 0.0024, Color32::from_rgb(130, 200, 245));
 
                 let seat_ex = add3(add3(ex_port, [0.0, 0.0, vz]), mul3(u_axis, -ex_travel));
-                let stem_ex = add3(seat_ex, mul3(u_axis, bore * 0.32));
-                scene.push_rod(cam, seat_ex, stem_ex, 0.0024, valve_head_col_ex);
-                scene.push_sphere(cam, seat_ex, 0.008, valve_head_col_ex, Stroke::NONE);
+                let stem_ex = add3(seat_ex, mul3(u_axis, bore * 0.30));
+                scene.push_rod(cam, seat_ex, stem_ex, 0.0024, Color32::from_rgb(240, 140, 95));
             }
 
-            // Pneumatic Valve Cover / Cam Box Rail
-            let cover_c = add3(head_c, mul3(u_axis, bore * 0.34));
-            let cover_col = if ctrl.n2_pressure_bar >= 100.0 {
-                Color32::from_rgb(54, 102, 142)
-            } else {
-                Color32::from_rgb(44, 50, 62)
-            };
-            scene.push_sphere(cam, cover_c, 0.015, cover_col, Stroke::NONE);
-            if let Some((p2, _, _)) = cam.project(cover_c) {
-                n2_pts.push(p2);
-            }
-            if throw_idx == 2 {
-                if bank_ang < 0.0 {
-                    bank_head_top_l = cover_c;
-                } else {
-                    bank_head_top_r = cover_c;
-                }
-            }
-
-            // Spark Plug + Ignition Flash
             if cyl.spark_firing {
-                scene.push_sphere(cam, head_c, 0.016, Color32::from_rgb(130, 232, 255), Stroke::NONE);
-                scene.push_sphere(cam, head_c, 0.008, Color32::WHITE, Stroke::NONE);
+                scene.push_spark(cam, head_c, 0.015, Color32::from_rgb(130, 232, 255));
+                scene.push_spark(cam, head_c, 0.007, Color32::WHITE);
             }
 
-            // Variable-Length Intake Stack & Trumpet pointing into the V-valley
-            let runner_base = add3(in_port, mul3(u_axis, 0.015));
-            let stack_dir = norm3(add3(mul3(u_axis, 0.92), mul3(u_perp, in_sign * 0.28)));
-            let trumpet_top = add3(runner_base, mul3(stack_dir, 0.032 + trumpet_len_m));
-            scene.push_cylinder_shell(
+            // Variable-Length Flared Intake Velocity Stack
+            let stack_col = if highlight == EnginePart::IntakeTrumpets {
+                Color32::from_rgb(86, 102, 128)
+            } else {
+                Color32::from_rgb(56, 64, 78)
+            };
+            let runner_base = add3(in_port, mul3(u_axis, 0.016));
+            let stack_dir = norm3(add3(mul3(u_axis, 0.92), mul3(u_perp, in_sign * 0.26)));
+            let trumpet_top = add3(runner_base, mul3(stack_dir, 0.030 + trumpet_len_m));
+            scene.push_cylinder_3d(
                 cam,
                 runner_base,
                 trumpet_top,
                 u_perp,
                 u_z,
-                bore * 0.21,
+                bore * 0.20,
                 bore * 0.26,
-                8,
-                Color32::from_rgb(44, 50, 60),
-                Stroke::new(0.8_f32, Color32::from_rgb(84, 94, 110)),
+                12,
+                stack_col,
+                false,
                 true,
             );
-            scene.push_ring_3d(
+            scene.push_disc_3d(
                 cam,
                 trumpet_top,
                 u_perp,
                 u_z,
-                bore * 0.27,
-                10,
-                Color32::from_rgb(28, 32, 40),
-                Stroke::new(2.0_f32, Color32::from_rgb(135, 148, 166)),
+                bore * 0.23,
+                12,
+                Color32::from_rgb(12, 14, 18),
+                false,
             );
-            // Brass Throttle Butterfly Plate inside each runner
+
             let tps_ang = (snap.effective_throttle as f32) * 1.48;
             let butterfly_c = add3(runner_base, mul3(stack_dir, 0.025));
             let plate_dir = add3(mul3(u_perp, tps_ang.cos()), mul3(stack_dir, tps_ang.sin()));
-            scene.push_line(
+            scene.push_line_3d(
                 cam,
-                sub3(butterfly_c, mul3(plate_dir, bore * 0.17)),
-                add3(butterfly_c, mul3(plate_dir, bore * 0.17)),
-                Stroke::new(2.6_f32, ACCENT_AMBER),
+                sub3(butterfly_c, mul3(plate_dir, bore * 0.16)),
+                add3(butterfly_c, mul3(plate_dir, bore * 0.16)),
+                Stroke::new(2.4_f32, ACCENT_AMBER),
             );
             if cyl.fuel_injecting {
-                scene.push_line(
+                scene.push_line_3d(
                     cam,
                     add3(runner_base, mul3(stack_dir, 0.018)),
-                    add3(in_port, mul3(u_axis, -0.012)),
-                    Stroke::new(2.4_f32, Color32::from_rgba_unmultiplied(92, 180, 230, 175)),
+                    add3(in_port, mul3(u_axis, -0.010)),
+                    Stroke::new(2.2_f32, Color32::from_rgba_unmultiplied(92, 180, 230, 175)),
                 );
             }
             if let Some((p2, _, _)) = cam.project(trumpet_top) {
                 trumpet_pts.push(p2);
             }
 
-            // 5-into-1 Swept Inconel Exhaust Primary Tube
-            let ex_bend1 = add3(add3(ex_port, mul3(u_axis, 0.022)), mul3(u_perp, ex_sign * 0.055));
-            let ex_bend2 = [
-                ex_sign * 0.255,
-                0.150,
-                z_cyl + 0.045,
-            ];
-            let col_entry = add3(col_tip, [0.0, 0.0, -0.04]);
-            scene.push_rod(cam, ex_port, ex_bend1, 0.014, ex_col);
-            scene.push_rod(cam, ex_bend1, ex_bend2, 0.014, ex_col);
-            scene.push_rod(cam, ex_bend2, col_entry, 0.014, ex_col);
+            // Clean Sculpted Exhaust Primary -> Outer Collector Log (zero overlapping spiderweb lines!)
+            let p_mid = add3(add3(ex_port, mul3(u_axis, 0.014)), mul3(u_perp, ex_sign * 0.052));
+            let p_col = [ex_bank_x, 0.128, (z_cyl + 0.025).clamp(col_z_a, col_z_b)];
+            scene.push_rod(cam, ex_port, p_mid, 0.013, ex_col);
+            scene.push_rod(cam, p_mid, p_col, 0.013, ex_col);
         }
     }
 
-    // 4. Longitudinal Pneumatic Valve Cam Rails (Top of Left & Right Cylinder Heads)
-    let pneu_rail_col = if ctrl.n2_pressure_bar >= 100.0 {
-        Color32::from_rgb(66, 138, 190)
-    } else {
-        Color32::from_rgb(56, 64, 78)
-    };
-    for &bank_ang in &[-half_v, half_v] {
-        let u_axis = [bank_ang.sin(), bank_ang.cos(), 0.0];
-        let rail_off = mul3(u_axis, head_dist + bore * 0.34);
-        let ra = add3([0.0, 0.0, z_front + 0.02], rail_off);
-        let rb = add3([0.0, 0.0, z_rear - 0.02], rail_off);
-        scene.push_rod(cam, ra, rb, 0.013, pneu_rail_col);
-    }
-
-    // 5. V-Valley Central Fuel Rail & Ignition Coil Pack Spine (Click Step 3!)
-    let rail_col = if ctrl.armed() {
+    // 6. Central V-Valley High-Pressure Fuel Rail & Ignition Pack (Click Step 3)
+    let mut rail_col = if ctrl.armed() {
         ACCENT_GREEN
     } else {
-        Color32::from_rgb(86, 94, 110)
+        Color32::from_rgb(76, 84, 98)
     };
-    let rail_y = head_dist * 0.94 + 0.036;
-    scene.push_rod(
-        cam,
-        [0.0, rail_y, z_front + 0.03],
-        [0.0, rail_y, z_rear - 0.03],
-        0.012,
-        rail_col,
-    );
+    if highlight == EnginePart::SparkPlugs {
+        rail_col = tint_mix(rail_col, ACCENT_GREEN, 0.50);
+    }
+    let rail_y = head_dist * 0.94 + 0.042;
+    let mut rail_pts = Vec::new();
     for t in 0..5 {
         let zt = (t as f32 - 2.0) * throw_spacing;
-        let cp = [0.0, rail_y, zt];
-        scene.push_sphere(cam, cp, 0.013, rail_col, Stroke::new(1.0_f32, TEXT_PRIMARY));
+        scene.push_box_3d(
+            cam,
+            [0.0, rail_y, zt],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            0.014,
+            0.012,
+            bay_hz,
+            rail_col,
+        );
+        let cp = [0.0, rail_y + 0.008, zt];
+        scene.push_box_3d(
+            cam,
+            cp,
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            0.018,
+            0.010,
+            0.016,
+            rail_col,
+        );
         if let Some((p2, _, _)) = cam.project(cp) {
             rail_pts.push(p2);
         }
     }
 
-    // 6. Side High-Pressure N2 Pneumatic Accumulator Bottle & Braided Feed Line (Click Step 2!)
-    let n2_col = if ctrl.n2_pressure_bar >= 100.0 {
+    // 7. Side High-Pressure N2 Pneumatic Accumulator Bottle (Click Step 2)
+    let bot_a = [0.232_f32, 0.026_f32, -0.09_f32];
+    let bot_b = [0.232_f32, 0.026_f32, 0.17_f32];
+    let mut bottle_col = if ctrl.n2_pressure_bar >= 100.0 {
         ACCENT_CYAN
     } else {
-        Color32::from_rgb(60, 72, 92)
+        Color32::from_rgb(58, 70, 88)
     };
-    let bot_a = [0.235_f32, 0.035_f32, -0.09_f32];
-    let bot_b = [0.235_f32, 0.035_f32, 0.17_f32];
-    scene.push_cylinder_shell(
+    if highlight == EnginePart::PneumaticHeads {
+        bottle_col = tint_mix(bottle_col, ACCENT_CYAN, 0.50);
+    }
+    scene.push_cylinder_3d(
         cam,
         bot_a,
         bot_b,
         [1.0, 0.0, 0.0],
         [0.0, 1.0, 0.0],
-        0.036,
-        0.036,
-        10,
-        n2_col,
-        Stroke::new(1.0_f32, Color32::from_rgb(35, 50, 70)),
+        0.032,
+        0.032,
+        12,
+        bottle_col,
+        true,
         true,
     );
-    scene.push_sphere(cam, bot_a, 0.034, n2_col, Stroke::NONE);
-    scene.push_sphere(cam, bot_b, 0.034, n2_col, Stroke::NONE);
-    // Feed lines from N2 bottle up to both pneumatic cylinder heads
-    let n2_mid = [0.235_f32, 0.035_f32, 0.04_f32];
-    scene.push_line(cam, n2_mid, bank_head_top_r, Stroke::new(2.0_f32, n2_col));
-    scene.push_line(cam, bank_head_top_r, bank_head_top_l, Stroke::new(1.6_f32, n2_col));
-    for &bp in &[bot_a, n2_mid, bot_b] {
+    for &bp in &[bot_a, [0.232, 0.026, 0.04], bot_b] {
         if let Some((p2, _, _)) = cam.project(bp) {
             n2_pts.push(p2);
         }
     }
 
-    // 7. Front Timing Pulley / Hand-Crank Damper (z = z_front - 0.04)
-    let front_c = [0.0, 0.0, z_front - 0.04];
-    let pulley_r = r_crank * 2.5;
-    scene.push_ring_3d(
+    // 8. Front Timing Damper Pulley (Drag when stopped to hand-crank)
+    let front_c0 = [0.0, 0.0, z_front - 0.030];
+    let front_c1 = [0.0, 0.0, z_front - 0.048];
+    let pulley_r = r_crank * 2.55;
+    let pulley_col = if highlight == EnginePart::FlywheelHandCrank {
+        Color32::from_rgb(66, 76, 94)
+    } else {
+        Color32::from_rgb(42, 48, 58)
+    };
+    scene.push_cylinder_3d(
         cam,
-        front_c,
+        front_c0,
+        front_c1,
         [1.0, 0.0, 0.0],
         [0.0, 1.0, 0.0],
         pulley_r,
-        14,
-        Color32::from_rgb(34, 39, 48),
-        Stroke::new(1.6_f32, Color32::from_rgb(104, 114, 132)),
+        pulley_r,
+        16,
+        pulley_col,
+        true,
+        true,
     );
     let ca = snap.crank_angle_rad as f32;
-    scene.push_line(
+    scene.push_line_3d(
         cam,
-        front_c,
-        [ca.sin() * pulley_r * 0.85, ca.cos() * pulley_r * 0.85, front_c[2]],
+        [0.0, 0.0, front_c1[2] - 0.003],
+        [ca.sin() * pulley_r * 0.85, ca.cos() * pulley_r * 0.85, front_c1[2] - 0.003],
         Stroke::new(3.0_f32, ACCENT_AMBER),
     );
-    scene.push_sphere(cam, front_c, 0.012, Color32::from_rgb(175, 185, 200), Stroke::NONE);
-    let front_pulley_pos = cam
-        .project(front_c)
-        .map(|(p, _, _)| p)
-        .unwrap_or(Pos2::ZERO);
+    let front_pulley_pos = cam.project(front_c1).map(|(p, _, _)| p).unwrap_or(Pos2::ZERO);
 
-    // 8. Rear Carbon Flywheel + External Pneumatic Air Starter Drive (Click & Hold Step 4!)
-    let fw_c = [0.0, 0.0, z_rear + 0.04];
-    let fw_r = r_crank * 3.8;
-    scene.push_ring_3d(
+    // 9. Rear Carbon Flywheel + External Pneumatic Starter Drive (Click & Hold Step 4)
+    let fw_c0 = [0.0, 0.0, z_rear + 0.028];
+    let fw_c1 = [0.0, 0.0, z_rear + 0.052];
+    let fw_r = r_crank * 3.85;
+    scene.push_cylinder_3d(
         cam,
-        fw_c,
+        fw_c0,
+        fw_c1,
         [1.0, 0.0, 0.0],
         [0.0, 1.0, 0.0],
         fw_r,
-        18,
-        Color32::from_rgb(24, 27, 34),
-        Stroke::new(2.0_f32, Color32::from_rgb(86, 96, 114)),
+        fw_r,
+        16,
+        Color32::from_rgb(30, 34, 42),
+        true,
+        true,
     );
-    scene.push_line(
+    scene.push_line_3d(
         cam,
-        [ca.sin() * (-fw_r * 0.9), ca.cos() * (-fw_r * 0.9), fw_c[2]],
-        [ca.sin() * (fw_r * 0.9), ca.cos() * (fw_r * 0.9), fw_c[2]],
+        [ca.sin() * (-fw_r * 0.85), ca.cos() * (-fw_r * 0.85), fw_c1[2] + 0.003],
+        [ca.sin() * (fw_r * 0.85), ca.cos() * (fw_r * 0.85), fw_c1[2] + 0.003],
         Stroke::new(2.4_f32, Color32::from_rgb(122, 132, 150)),
     );
 
     let ready_to_crank = min_temp >= 60.0 && ctrl.n2_pressure_bar >= 100.0 && ctrl.armed() && !snap.is_running;
-    let starter_col = if ctrl.starter_active {
+    let mut starter_col = if ctrl.starter_active {
         ACCENT_AMBER
     } else if ready_to_crank {
         ACCENT_GREEN
     } else {
-        Color32::from_rgb(90, 98, 112)
+        Color32::from_rgb(88, 96, 112)
     };
-    let starter_a = [0.0, 0.0, z_rear + 0.055];
-    let starter_b = [0.0, 0.0, z_rear + 0.175];
-    scene.push_cylinder_shell(
+    if highlight == EnginePart::CrankHubStarter {
+        starter_col = tint_mix(starter_col, ACCENT_AMBER, 0.45);
+    }
+    let starter_a = [0.0, 0.0, z_rear + 0.054];
+    let starter_b = [0.0, 0.0, z_rear + 0.165];
+    scene.push_cylinder_3d(
         cam,
         starter_a,
         starter_b,
         [1.0, 0.0, 0.0],
         [0.0, 1.0, 0.0],
         0.032,
-        0.036,
-        10,
+        0.035,
+        12,
         starter_col,
-        Stroke::new(1.2_f32, Color32::from_rgb(20, 24, 30)),
+        true,
         true,
     );
-    scene.push_ring_3d(
-        cam,
-        starter_b,
-        [1.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0],
-        0.036,
-        10,
-        starter_col,
-        Stroke::new(1.2_f32, Color32::WHITE),
-    );
-    let starter_pos = cam
-        .project(starter_b)
-        .map(|(p, _, _)| p)
-        .unwrap_or(Pos2::ZERO);
-
-    // Project clean non-overlapping leader tag rects for the 4 3D startup subsystems
-    let pre_anchor = cam
-        .project([-0.155, 0.055, -0.06])
-        .map(|(p, _, _)| p)
-        .unwrap_or(Pos2::new(400.0, 500.0));
-    let n2_anchor = cam
-        .project([0.235, 0.035, 0.05])
-        .map(|(p, _, _)| p)
-        .unwrap_or(Pos2::new(720.0, 480.0));
-    let rail_anchor = cam
-        .project([0.0, rail_y + 0.04, -0.10])
-        .map(|(p, _, _)| p)
-        .unwrap_or(Pos2::new(560.0, 260.0));
-
-    let tag_size = Vec2::new(136.0, 22.0);
-    let tag_preheat = Rect::from_center_size(pre_anchor + Vec2::new(-52.0, 38.0), tag_size);
-    let tag_n2 = Rect::from_center_size(n2_anchor + Vec2::new(62.0, 36.0), tag_size);
-    let tag_rail = Rect::from_center_size(rail_anchor + Vec2::new(0.0, -56.0), tag_size);
-    let tag_starter = Rect::from_center_size(starter_pos + Vec2::new(48.0, 32.0), tag_size);
+    let starter_pos = cam.project(starter_b).map(|(p, _, _)| p).unwrap_or(Pos2::ZERO);
 
     HitTargets3D {
         preheat_pts,
@@ -1304,185 +1350,20 @@ fn build_v10_scene_3d(
         starter_pos,
         front_pulley_pos,
         trumpet_pts,
-        tag_preheat,
-        tag_n2,
-        tag_rail,
-        tag_starter,
     }
 }
 
-fn draw_3d_callout_tags(
-    p: &egui::Painter,
-    hits: &HitTargets3D,
-    snap: &TelemetrySnapshot,
-    ctrl: &SharedControls,
-    hovered: EnginePart,
-    starter_down: bool,
-) {
-    let min_temp = snap.coolant_temp_c.min(snap.oil_temp_c);
-    let warm_ok = min_temp >= 60.0;
-    let pneu_ok = ctrl.n2_pressure_bar >= 100.0;
-    let armed_ok = ctrl.armed();
-
-    let next_step = if !warm_ok {
-        1
-    } else if !pneu_ok {
-        2
-    } else if !armed_ok {
-        3
-    } else if !snap.is_running {
-        4
-    } else {
-        0
-    };
-
-    let draw_tag = |rect: Rect, anchor: Pos2, title: String, step_id: usize, done: bool, active: bool, hovered_me: bool| {
-        let col = if active {
-            ACCENT_AMBER
-        } else if done {
-            ACCENT_GREEN
-        } else if next_step == step_id || hovered_me {
-            ACCENT_AMBER
-        } else {
-            TEXT_MUTED
-        };
-        let border_w = if next_step == step_id || hovered_me || active {
-            1.5_f32
-        } else {
-            0.9_f32
-        };
-        p.line_segment([anchor, rect.center()], Stroke::new(1.0_f32, col));
-        p.circle_filled(anchor, 2.8, col);
-        p.rect_filled(rect, 3.0, bg_tint());
-        p.rect_stroke(rect, 3.0, Stroke::new(border_w, col));
-        p.text(
-            rect.center(),
-            Align2::CENTER_CENTER,
-            title,
-            FontId::monospace(10.0),
-            col,
-        );
-    };
-
-    // Hide tags when running smoothly at high RPM unless hovered so view stays ultra clean
-    let show_tags = !snap.is_running || hovered != EnginePart::None || starter_down;
-    if !show_tags {
-        return;
-    }
-
-    let pre_a = hits.preheat_pts.first().copied().unwrap_or(hits.tag_preheat.center());
-    draw_tag(
-        hits.tag_preheat,
-        pre_a,
-        if warm_ok {
-            format!("1 PREHEAT {:.0}C", min_temp)
-        } else if ctrl.preheat_on() {
-            format!("1 HEATING {:.0}C", min_temp)
-        } else {
-            "1 CLICK PRE-HEAT".to_string()
-        },
-        1,
-        warm_ok,
-        ctrl.preheat_on() && !warm_ok,
-        hovered == EnginePart::CylinderBlock,
-    );
-
-    let n2_a = hits.n2_pts.last().copied().unwrap_or(hits.tag_n2.center());
-    draw_tag(
-        hits.tag_n2,
-        n2_a,
-        if pneu_ok {
-            format!("2 N2: {:.0} BAR", ctrl.n2_pressure_bar)
-        } else {
-            "2 CLICK N2 (0 BAR)".to_string()
-        },
-        2,
-        pneu_ok,
-        false,
-        hovered == EnginePart::PneumaticHeads,
-    );
-
-    let rail_a = hits.rail_pts.first().copied().unwrap_or(hits.tag_rail.center());
-    draw_tag(
-        hits.tag_rail,
-        rail_a,
-        if armed_ok {
-            "3 FUEL+IGN: ARMED".to_string()
-        } else {
-            "3 CLICK FUEL & IGN".to_string()
-        },
-        3,
-        armed_ok,
-        false,
-        hovered == EnginePart::SparkPlugs,
-    );
-
-    draw_tag(
-        hits.tag_starter,
-        hits.starter_pos,
-        if starter_down {
-            "4 CRANKING...".to_string()
-        } else if snap.is_running {
-            "4 STARTER READY".to_string()
-        } else {
-            "4 HOLD STARTER".to_string()
-        },
-        4,
-        snap.is_running,
-        starter_down,
-        hovered == EnginePart::CrankHubStarter,
-    );
-}
-
 // ============================================================================
-// OPEN-SPACE HUD ELEMENTS (FRAMELESS OVERLAYS ON SINGLE CANVAS)
+// OPEN-SPACE MINIMAL HUD ELEMENTS
 // ============================================================================
 
-#[allow(clippy::too_many_arguments)]
 fn draw_top_hud(
     ui: &mut egui::Ui,
     p: &egui::Painter,
     full_rect: Rect,
-    tl: Rect,
     snap: &TelemetrySnapshot,
-    ctrl: &mut SharedControls,
-    cam_yaw: &mut f32,
-    cam_pitch: &mut f32,
-    cam_zoom: &mut f32,
+    ctrl: &SharedControls,
 ) {
-    // Top-left title & audio controls floating directly on canvas
-    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(tl), |ui| {
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("F1 3.0L V10")
-                    .monospace()
-                    .strong()
-                    .size(14.0)
-                    .color(TEXT_PRIMARY),
-            );
-            ui.add_space(10.0);
-            let mute_lbl = if ctrl.muted { "MUTED" } else { "AUDIO" };
-            if ui.small_button(mute_lbl).clicked() {
-                ctrl.muted = !ctrl.muted;
-            }
-            ui.add(egui::Slider::new(&mut ctrl.master_volume, 0.0..=1.5).show_value(false));
-        });
-        ui.horizontal(|ui| {
-            if ui.small_button("Auto Start [Q]").clicked() {
-                ctrl.quick_start_trigger = true;
-            }
-            if ui.small_button("Reset Engine").clicked() {
-                ctrl.reset_repair_trigger = true;
-            }
-            if ui.small_button("Reset View [R]").clicked() {
-                *cam_yaw = -0.62;
-                *cam_pitch = 0.34;
-                *cam_zoom = 1.0;
-            }
-        });
-    });
-
-    // Center Open-Space Tachometer LED Bar + Primary Numbers
     let center_x = full_rect.center().x;
     let bar_w = 270.0_f32;
     let bar_left = center_x - bar_w * 0.5;
@@ -1493,7 +1374,7 @@ fn draw_top_hud(
         let thresh = 13_500.0 + frac * (ctrl.rev_limit_rpm - 13_500.0);
         let lit = snap.rpm >= thresh;
         let col = if !lit {
-            Color32::from_rgb(22, 26, 33)
+            Color32::from_rgb(20, 24, 31)
         } else if i < 5 {
             ACCENT_GREEN
         } else if i < 10 {
@@ -1529,7 +1410,7 @@ fn draw_top_hud(
         p.text(Pos2::new(*x, led_y + 25.0), Align2::CENTER_TOP, val, FontId::monospace(15.0), *c);
     }
 
-    // Status Flag Top Right-of-Center
+    // Subtle status badge top-right
     let min_temp = snap.coolant_temp_c.min(snap.oil_temp_c);
     let (st_txt, st_col) = if snap.cold_seized {
         ("COLD SEIZED", ACCENT_RED)
@@ -1544,16 +1425,25 @@ fn draw_top_hud(
     } else if min_temp >= 60.0 && ctrl.n2_pressure_bar >= 100.0 && ctrl.armed() {
         ("READY TO CRANK", ACCENT_GREEN)
     } else if ctrl.preheat_on() && min_temp < 60.0 {
-        ("WARMING", ACCENT_AMBER)
+        ("WARMING FLUIDS", ACCENT_AMBER)
     } else {
         ("OFFLINE", TEXT_MUTED)
     };
     p.text(
-        Pos2::new(full_rect.right() - 22.0, full_rect.top() + 20.0),
+        Pos2::new(full_rect.right() - 22.0, full_rect.top() + 22.0),
         Align2::RIGHT_TOP,
         st_txt,
-        FontId::monospace(12.0),
+        FontId::monospace(11.5),
         st_col,
+    );
+
+    // Top-left minimal engine title
+    p.text(
+        Pos2::new(full_rect.left() + 26.0, full_rect.top() + 20.0),
+        Align2::LEFT_TOP,
+        "F1 3.0L V10",
+        FontId::monospace(13.0),
+        TEXT_PRIMARY,
     );
 }
 
@@ -1566,18 +1456,16 @@ fn draw_vertical_throttle_slider(
     ctrl: &mut SharedControls,
     dragging_bar: &mut bool,
 ) {
-    // Label above slider
     p.text(
-        Pos2::new(bar_rect.center().x, bar_rect.top() - 16.0),
+        Pos2::new(bar_rect.left(), bar_rect.top() - 16.0),
         Align2::LEFT_BOTTOM,
         format!("THROTTLE {:3.0}%", ctrl.throttle * 100.0),
-        FontId::monospace(11.0),
+        FontId::monospace(10.5),
         TEXT_PRIMARY,
     );
 
-    // Interactive region covering the vertical track
     let resp = ui.interact(hit_rect, ui.id().with("vert_throttle"), Sense::click_and_drag());
-    if resp.drag_started() || resp.clicked() || (resp.is_pointer_button_down_on()) {
+    if resp.drag_started() || resp.clicked() || resp.is_pointer_button_down_on() {
         *dragging_bar = true;
     }
     if !ui.ctx().input(|i| i.pointer.primary_down()) {
@@ -1593,11 +1481,9 @@ fn draw_vertical_throttle_slider(
         ui.ctx().set_cursor_icon(CursorIcon::ResizeVertical);
     }
 
-    // Track background & border
     p.rect_filled(bar_rect, 3.0, BG_PILL);
     p.rect_stroke(bar_rect, 3.0, Stroke::new(1.0_f32, BORDER_SUBTLE));
 
-    // Requested throttle bar + thin effective throttle (IAC / blip) overlay
     let req_h = (ctrl.throttle as f32) * bar_rect.height();
     let eff_h = (snap.effective_throttle as f32) * bar_rect.height();
     if eff_h > 1.0 {
@@ -1605,7 +1491,7 @@ fn draw_vertical_throttle_slider(
             Pos2::new(bar_rect.left() + 2.0, bar_rect.bottom() - eff_h),
             Pos2::new(bar_rect.right() - 2.0, bar_rect.bottom()),
         );
-        p.rect_filled(eff_rect, 2.0, Color32::from_rgba_unmultiplied(92, 180, 230, 55));
+        p.rect_filled(eff_rect, 2.0, Color32::from_rgba_unmultiplied(92, 180, 230, 50));
     }
     if req_h > 1.0 {
         let req_rect = Rect::from_min_max(
@@ -1615,200 +1501,210 @@ fn draw_vertical_throttle_slider(
         p.rect_filled(req_rect, 2.0, ACCENT_GREEN);
     }
 
-    // Grab handle line
     let handle_y = bar_rect.bottom() - req_h;
     p.line_segment(
         [Pos2::new(bar_rect.left() - 3.0, handle_y), Pos2::new(bar_rect.right() + 3.0, handle_y)],
-        Stroke::new(3.0_f32, TEXT_PRIMARY),
+        Stroke::new(2.5_f32, TEXT_PRIMARY),
     );
 
-    // Tick marks & Keybind markings along the right side of the vertical slider
     let marks = [
-        (1.00_f32, "100%  [SPACE] WOT", ACCENT_GREEN),
-        (0.75_f32, " 75%  [W / ↑] +", TEXT_MUTED),
-        (0.50_f32, " 50%  Half Load", TEXT_MUTED),
-        (0.25_f32, " 25%  [S / ↓] -", TEXT_MUTED),
-        (0.00_f32, "  0%  Idle Cut", TEXT_MUTED),
+        (1.00_f32, "100%  [SPACE]", ACCENT_GREEN),
+        (0.75_f32, " 75%  [W / ↑]", TEXT_MUTED),
+        (0.50_f32, " 50%", TEXT_MUTED),
+        (0.25_f32, " 25%  [S / ↓]", TEXT_MUTED),
+        (0.00_f32, "  0%  Idle", TEXT_MUTED),
     ];
     for &(frac, label, col) in &marks {
         let ty = bar_rect.bottom() - frac * bar_rect.height();
         p.line_segment(
-            [Pos2::new(bar_rect.right() + 2.0, ty), Pos2::new(bar_rect.right() + 10.0, ty)],
+            [Pos2::new(bar_rect.right() + 2.0, ty), Pos2::new(bar_rect.right() + 9.0, ty)],
             Stroke::new(1.0_f32, BORDER_SUBTLE),
         );
         p.text(
-            Pos2::new(bar_rect.right() + 14.0, ty),
+            Pos2::new(bar_rect.right() + 13.0, ty),
             Align2::LEFT_CENTER,
             label,
-            FontId::monospace(10.0),
+            FontId::monospace(9.5),
             col,
         );
     }
 
-    // Additional keybind legend lines neatly stacked near slider
-    let kb_top = bar_rect.bottom() - bar_rect.height() * 0.62;
-    let kb_x = bar_rect.right() + 14.0;
-    let extra_binds = [
-        "[Z / X]    Shift Down / Up",
-        "[MMB Drag] Orbit 3D Engine",
-        "[Wheel]    Zoom In / Out",
-        "[Q / R]    Auto Start / View",
-    ];
-    for (idx, line) in extra_binds.iter().enumerate() {
-        p.text(
-            Pos2::new(kb_x, kb_top + idx as f32 * 14.0),
-            Align2::LEFT_TOP,
-            *line,
-            FontId::monospace(9.5),
-            Color32::from_rgb(95, 104, 118),
-        );
-    }
+    p.text(
+        Pos2::new(bar_rect.left(), bar_rect.bottom() + 18.0),
+        Align2::LEFT_TOP,
+        "[Z/X] Shift  •  [Q] Auto",
+        FontId::monospace(9.5),
+        Color32::from_rgb(92, 100, 115),
+    );
 }
 
-fn draw_bottom_left_hud(
+#[allow(clippy::too_many_arguments)]
+fn draw_bottom_hamburger_menu(
     ui: &mut egui::Ui,
-    rect: Rect,
+    p: &egui::Painter,
+    btn_rect: Rect,
+    popover_rect: Rect,
     snap: &TelemetrySnapshot,
     ctrl: &mut SharedControls,
-    show_ecu: &mut bool,
-) -> bool {
-    let mut starter_btn_down = false;
-    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
-        let min_temp = snap.coolant_temp_c.min(snap.oil_temp_c);
-        let warm_ok = min_temp >= 60.0;
-        let pneu_ok = ctrl.n2_pressure_bar >= 100.0;
-        let armed_ok = ctrl.armed();
+    menu_open: &mut bool,
+    cam_yaw: &mut f32,
+    cam_pitch: &mut f32,
+    cam_zoom: &mut f32,
+) {
+    // Hamburger toggle button + current active mode badge
+    let resp = ui.interact(btn_rect, ui.id().with("hamburger_btn"), Sense::click());
+    if resp.clicked() {
+        *menu_open = !*menu_open;
+    }
+    let fill = if *menu_open || resp.hovered() {
+        Color32::from_rgb(24, 28, 37)
+    } else {
+        BG_PILL
+    };
+    p.rect_filled(btn_rect, 4.0, fill);
+    p.rect_stroke(btn_rect, 4.0, Stroke::new(1.0_f32, BORDER_SUBTLE));
 
-        let (guide, gcol) = if snap.cold_seized {
-            ("SEIZED COLD (<60C) — Pre-heat block first!", ACCENT_RED)
-        } else if !warm_ok && !ctrl.preheat_on() {
-            ("1. Click 3D Block (or pill) to Pre-Heat 60C", ACCENT_AMBER)
-        } else if !warm_ok {
-            ("Warming block fluids to 60C...", ACCENT_AMBER)
-        } else if !pneu_ok {
-            ("2. Click 3D N2 Bottle to pressurize valves", ACCENT_AMBER)
-        } else if !armed_ok {
-            ("3. Click 3D V-Valley Rail to arm Fuel & Spark", ACCENT_AMBER)
-        } else if !snap.is_running {
-            ("4. Hold 3D Rear Starter (or HOLD CRANK)", ACCENT_GREEN)
-        } else {
-            ("ENGINE RUNNING — Use Throttle or Auto Mode", ACCENT_GREEN)
-        };
-        ui.label(RichText::new(guide).monospace().size(10.5).color(gcol));
-        ui.add_space(4.0);
+    // Draw crisp 3-bar hamburger icon
+    let icon_x0 = btn_rect.left() + 11.0;
+    let icon_x1 = btn_rect.left() + 25.0;
+    let cy = btn_rect.center().y;
+    for &dy in &[-4.5_f32, 0.0_f32, 4.5_f32] {
+        p.line_segment(
+            [Pos2::new(icon_x0, cy + dy), Pos2::new(icon_x1, cy + dy)],
+            Stroke::new(1.6_f32, TEXT_PRIMARY),
+        );
+    }
 
-        // Quick backup/accessibility startup pills (synchronized with 3D model parts)
-        ui.horizontal(|ui| {
-            let pre_col = if warm_ok { ACCENT_GREEN } else if ctrl.preheat_on() { ACCENT_AMBER } else { TEXT_PRIMARY };
-            if ui.add_sized([58.0, 21.0], egui::Button::new(RichText::new(format!("1 {:.0}C", min_temp)).monospace().size(9.5).color(pre_col))).clicked() {
-                ctrl.set_preheat(!ctrl.preheat_on());
+    let mode_text = match ctrl.bench_mode {
+        BenchMode::FreeRev => "MANUAL REV".to_string(),
+        BenchMode::DynoSweep => {
+            if snap.dyno_sweep_running {
+                "AUTO PULL...".to_string()
+            } else {
+                "AUTO PULL".to_string()
             }
-            if ui.add_sized([56.0, 21.0], egui::Button::new(RichText::new("2 N2").monospace().size(9.5).color(if pneu_ok { ACCENT_GREEN } else { TEXT_PRIMARY }))).clicked() {
-                ctrl.toggle_pneumatics();
-            }
-            if ui.add_sized([58.0, 21.0], egui::Button::new(RichText::new("3 ARM").monospace().size(9.5).color(if armed_ok { ACCENT_GREEN } else { TEXT_PRIMARY }))).clicked() {
-                ctrl.toggle_arm();
-            }
-            let sb = ui.add_sized(
-                [66.0, 21.0],
-                egui::Button::new(RichText::new("4 CRANK").monospace().size(9.5).color(if ctrl.starter_active { ACCENT_AMBER } else { TEXT_PRIMARY })),
-            );
-            starter_btn_down = sb.is_pointer_button_down_on();
-        });
-
-        ui.add_space(6.0);
-
-        // Open-space Test Mode Pills
-        egui::Grid::new("open_modes")
-            .num_columns(2)
-            .spacing([5.0, 4.0])
-            .show(ui, |ui| {
-                let modes = [
-                    (BenchMode::FreeRev, "Manual Rev"),
-                    (BenchMode::DynoSweep, "Auto Dyno Pull"),
-                    (BenchMode::MonzaHotlapAuto, "Auto Monza Lap"),
-                    (BenchMode::TrackManualGearbox, "7-Spd Gearbox"),
-                ];
-                for (i, (m, lbl)) in modes.iter().enumerate() {
-                    let sel = ctrl.bench_mode == *m;
-                    if ui.add_sized([120.0, 21.0], egui::SelectableLabel::new(sel, *lbl)).clicked() {
-                        ctrl.bench_mode = *m;
-                        if *m == BenchMode::DynoSweep {
-                            ctrl.start_dyno_sweep = true;
-                        } else if *m == BenchMode::MonzaHotlapAuto && !snap.is_running {
-                            ctrl.quick_start_trigger = true;
-                        }
-                    }
-                    if i % 2 == 1 {
-                        ui.end_row();
-                    }
-                }
-            });
-
-        ui.add_space(4.0);
-        match ctrl.bench_mode {
-            BenchMode::TrackManualGearbox => {
-                ui.horizontal(|ui| {
-                    if ui.small_button("- [Z]").clicked() {
-                        ctrl.requested_gear = ctrl.requested_gear.saturating_sub(1).max(1);
-                    }
-                    ui.label(RichText::new(format!("GEAR {}", ctrl.requested_gear)).monospace().strong());
-                    if ui.small_button("+ [X]").clicked() {
-                        ctrl.requested_gear = (ctrl.requested_gear + 1).min(7);
-                    }
-                });
-            }
-            BenchMode::MonzaHotlapAuto => {
-                ui.label(
-                    RichText::new(format!("{} ({:.0} m)", snap.monza_sector_name, snap.monza_dist_m))
-                        .monospace()
-                        .size(10.0)
-                        .color(ACCENT_CYAN),
-                );
-            }
-            BenchMode::DynoSweep => {
-                if ui.small_button("Re-Run Auto Dyno Pull").clicked() {
-                    ctrl.start_dyno_sweep = true;
-                }
-                if snap.dyno_sweep_running {
-                    ui.label(
-                        RichText::new("Sweeping 5.5k -> 19.5k RPM...")
-                            .monospace()
-                            .size(10.0)
-                            .color(ACCENT_GREEN),
-                    );
-                }
-            }
-            _ => {}
         }
+        BenchMode::MonzaHotlapAuto => format!("MONZA • {}", snap.monza_sector_name),
+        BenchMode::TrackManualGearbox => format!("GEAR {} [Z/X]", ctrl.requested_gear),
+        BenchMode::DynoManualBrake | BenchMode::DynoRpmHold => "DYNO BENCH".to_string(),
+    };
+    p.text(
+        Pos2::new(icon_x1 + 10.0, cy),
+        Align2::LEFT_CENTER,
+        mode_text,
+        FontId::monospace(10.0),
+        ACCENT_CYAN,
+    );
 
-        ui.add_space(4.0);
-        if ui.small_button(if *show_ecu { "Hide ECU Tuning" } else { "ECU & Dyno Tuning..." }).clicked() {
-            *show_ecu = !*show_ecu;
-        }
-        if *show_ecu {
+    if !*menu_open {
+        return;
+    }
+
+    // Floating Popover Menu directly above the bottom hamburger button
+    p.rect_filled(popover_rect, 5.0, bg_popover());
+    p.rect_stroke(popover_rect, 5.0, Stroke::new(1.0_f32, Color32::from_rgb(44, 52, 66)));
+
+    ui.allocate_new_ui(
+        egui::UiBuilder::new().max_rect(popover_rect.shrink(10.0)),
+        |ui| {
+            ui.label(RichText::new("DRIVE / TEST MODE").monospace().size(9.5).color(TEXT_MUTED));
+            let mode_items = [
+                (BenchMode::FreeRev, "Manual Rev"),
+                (BenchMode::DynoSweep, "Auto Pull (5.5k–19.5k)"),
+                (BenchMode::MonzaHotlapAuto, "Monza Lap (Auto)"),
+                (BenchMode::TrackManualGearbox, "7-Spd Gearbox [Z/X]"),
+            ];
+            for &(m, label) in &mode_items {
+                let sel = ctrl.bench_mode == m;
+                if ui
+                    .add_sized([202.0, 22.0], egui::SelectableLabel::new(sel, label))
+                    .clicked()
+                {
+                    ctrl.bench_mode = m;
+                    if m == BenchMode::DynoSweep {
+                        ctrl.start_dyno_sweep = true;
+                    } else if m == BenchMode::MonzaHotlapAuto && !snap.is_running {
+                        ctrl.quick_start_trigger = true;
+                    }
+                    *menu_open = false;
+                }
+            }
+
+            ui.separator();
+
             ui.horizontal(|ui| {
-                if ui.selectable_label(ctrl.bench_mode == BenchMode::DynoManualBrake, "Brake").clicked() {
-                    ctrl.bench_mode = BenchMode::DynoManualBrake;
+                if ui.small_button("Auto Start [Q]").clicked() {
+                    ctrl.quick_start_trigger = true;
+                    *menu_open = false;
                 }
-                if ui.selectable_label(ctrl.bench_mode == BenchMode::DynoRpmHold, "RPM Hold").clicked() {
-                    ctrl.bench_mode = BenchMode::DynoRpmHold;
+                if ui.small_button("Reset").clicked() {
+                    ctrl.reset_repair_trigger = true;
+                    *menu_open = false;
+                }
+                if ui.small_button("View [R]").clicked() {
+                    *cam_yaw = -0.62;
+                    *cam_pitch = 0.34;
+                    *cam_zoom = 1.0;
+                    *menu_open = false;
                 }
             });
-            if ctrl.bench_mode == BenchMode::DynoManualBrake {
-                ui.add(egui::Slider::new(&mut ctrl.dyno_brake_load, 0.0..=1.0).text("Brake"));
-            } else if ctrl.bench_mode == BenchMode::DynoRpmHold {
-                ui.add(egui::Slider::new(&mut ctrl.dyno_hold_rpm, 4000.0..=19500.0).step_by(250.0).text("Hold"));
-            }
-            ui.add(egui::Slider::new(&mut ctrl.lambda_target, 0.75..=1.20).text("Lambda"));
-            ui.add(egui::Slider::new(&mut ctrl.spark_offset_deg, -15.0..=15.0).text("Spark°"));
-            ui.checkbox(&mut ctrl.trumpets_auto, "Auto Trumpets");
-            if !ctrl.trumpets_auto {
-                ui.add(egui::Slider::new(&mut ctrl.manual_trumpet_mm, 75.0..=135.0).text("mm"));
-            }
-        }
-    });
-    starter_btn_down
+
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                let mute_lbl = if ctrl.muted { "Muted" } else { "Audio" };
+                if ui.small_button(mute_lbl).clicked() {
+                    ctrl.muted = !ctrl.muted;
+                }
+                ui.add(egui::Slider::new(&mut ctrl.master_volume, 0.0..=1.5).show_value(false));
+            });
+        },
+    );
+}
+
+fn draw_footer_prompt(
+    p: &egui::Painter,
+    center_x: f32,
+    y: f32,
+    snap: &TelemetrySnapshot,
+    ctrl: &SharedControls,
+    highlight: EnginePart,
+) {
+    let min_temp = snap.coolant_temp_c.min(snap.oil_temp_c);
+    let warm_ok = min_temp >= 60.0;
+    let pneu_ok = ctrl.n2_pressure_bar >= 100.0;
+    let armed_ok = ctrl.armed();
+
+    let (msg, col) = if highlight != EnginePart::None {
+        let m = match highlight {
+            EnginePart::CylinderBlock => "3D Cylinder Block Pre-Heater — Click to toggle Pre-Heat (22°C -> 60°C)",
+            EnginePart::PneumaticHeads => "3D N2 Accumulator & Cam Covers — Click to pressurize valve springs (165 bar)",
+            EnginePart::SparkPlugs => "3D V-Valley Fuel Rail & Coils — Click to arm Fuel & Ignition",
+            EnginePart::CrankHubStarter => "3D Rear Pneumatic Air Starter — Click & Hold to crank V10",
+            EnginePart::IntakeTrumpets => "3D Intake Trumpets — Drag Up / Down to open throttle",
+            EnginePart::FlywheelHandCrank => "3D Front Crank Pulley — Drag circularly when stopped to hand-crank",
+            EnginePart::None => "",
+        };
+        (m.to_string(), TEXT_PRIMARY)
+    } else if snap.cold_seized {
+        ("COLD SEIZED (<60C) — Click the 3D Block Pre-Heaters to warm fluids first".to_string(), ACCENT_RED)
+    } else if !warm_ok && !ctrl.preheat_on() {
+        (
+            format!("STEP 1/4: Click the 3D Lower Block Manifolds to Pre-Heat ({:.0}C -> 60C)  •  or [Q] Auto Start", min_temp),
+            ACCENT_AMBER,
+        )
+    } else if !warm_ok {
+        (format!("Warming block & oil... ({:.0}C / 60C)", min_temp), ACCENT_AMBER)
+    } else if !pneu_ok {
+        ("STEP 2/4: Click the 3D N2 Cylinder (right flank) or Cam Covers to pressurize (165 bar)".to_string(), ACCENT_AMBER)
+    } else if !armed_ok {
+        ("STEP 3/4: Click the 3D V-Valley Fuel Rail (center top) to arm Fuel & Ignition".to_string(), ACCENT_AMBER)
+    } else if !snap.is_running {
+        ("STEP 4/4: Click & Hold the 3D Rear Air Starter to fire up the V10".to_string(), ACCENT_GREEN)
+    } else {
+        ("MMB Drag: Orbit 3D Engine  •  Scroll: Zoom  •  [R] Reset View".to_string(), TEXT_MUTED)
+    };
+
+    p.text(Pos2::new(center_x, y), Align2::CENTER_BOTTOM, msg, FontId::monospace(10.0), col);
 }
 
 fn draw_right_hud(
@@ -1819,62 +1715,285 @@ fn draw_right_hud(
     diag_plot: &mut DiagnosticPlot,
 ) {
     ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
-        let (peak_bhp, peak_bhp_rpm, peak_nm, peak_nm_rpm) = compute_dyno_peaks(snap);
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("DYNO").monospace().strong().size(10.5).color(TEXT_MUTED));
-            ui.label(
-                RichText::new(format!("{:.0}BHP@{:.0} | {:.0}Nm@{:.0}", peak_bhp, peak_bhp_rpm, peak_nm, peak_nm_rpm))
-                    .monospace()
-                    .size(9.5)
-                    .color(TEXT_PRIMARY),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("Clr").clicked() {
-                    ctrl.clear_dyno_trace = true;
-                }
-            });
-        });
-        draw_frameless_dyno_plot(ui, snap);
+        // Card 1: Clean Dyno Power & Torque Graph
+        draw_dyno_card(ui, snap, ctrl);
 
-        ui.add_space(8.0);
+        ui.add_space(10.0);
 
-        ui.horizontal(|ui| {
-            if ui.selectable_label(*diag_plot == DiagnosticPlot::PvDiagram, "P-V LOOP").clicked() {
-                *diag_plot = DiagnosticPlot::PvDiagram;
-            }
-            if ui.selectable_label(*diag_plot == DiagnosticPlot::Waveform, "EXHAUST WAVE").clicked() {
-                *diag_plot = DiagnosticPlot::Waveform;
-            }
-        });
-        match *diag_plot {
-            DiagnosticPlot::PvDiagram => draw_frameless_pv_plot(ui, snap),
-            DiagnosticPlot::Waveform => draw_frameless_scope_plot(ui, snap),
-        }
+        // Card 2: Switchable P-V Loop / Exhaust Acoustic Waveform
+        draw_diag_card(ui, snap, diag_plot);
 
-        ui.add_space(8.0);
-        ui.label(RichText::new("TELEMETRY").monospace().strong().size(10.5).color(TEXT_MUTED));
-        egui::Grid::new("open_vitals")
-            .num_columns(2)
-            .spacing([14.0, 3.0])
-            .show(ui, |ui| {
-                vital_row(ui, "Block / Oil", &format!("{:.0}°C / {:.0}°C", snap.coolant_temp_c, snap.oil_temp_c), snap.coolant_temp_c > 112.0);
-                vital_row(ui, "Exhaust EGT", &format!("{:.0} °C", snap.egt_c), snap.egt_c > 980.0);
-                vital_row(ui, "Valve N2", &format!("{:.0} / {:.0} bar", ctrl.n2_pressure_bar, snap.required_n2_bar), snap.valve_float_active);
-                vital_row(ui, "Plenum / VE", &format!("{:.2}b / {:.0}%", snap.plenum_pressure_bar, snap.ve_percent), false);
-                vital_row(ui, "Trumpets", &format!("{:.1} mm", snap.trumpet_length_mm), false);
-                if snap.bore_health < 0.99 || snap.knock_count > 0 {
-                    vital_row(ui, "Bore / Knocks", &format!("{:.0}% / {}", snap.bore_health * 100.0, snap.knock_count), true);
-                }
-            });
+        ui.add_space(10.0);
+
+        // Compact 4-Cell Vitals Strip
+        draw_vitals_strip(ui, snap, ctrl);
     });
 }
 
-fn vital_row(ui: &mut egui::Ui, label: &str, value: &str, warn: bool) {
-    ui.label(RichText::new(label).monospace().size(10.0).color(TEXT_MUTED));
-    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-        ui.label(RichText::new(value).monospace().size(10.5).color(if warn { ACCENT_RED } else { TEXT_PRIMARY }));
-    });
-    ui.end_row();
+fn draw_dyno_card(ui: &mut egui::Ui, snap: &TelemetrySnapshot, ctrl: &mut SharedControls) {
+    let card_h = 198.0_f32;
+    let card_w = ui.available_width().max(260.0);
+    let (card_rect, _) = ui.allocate_exact_size(Vec2::new(card_w, card_h), Sense::hover());
+    let p = ui.painter_at(card_rect);
+    p.rect_filled(card_rect, 5.0, bg_card());
+    p.rect_stroke(card_rect, 5.0, Stroke::new(1.0_f32, BORDER_SUBTLE));
+
+    let (peak_bhp, peak_bhp_rpm, peak_nm, _) = compute_dyno_peaks(snap);
+    p.text(
+        Pos2::new(card_rect.left() + 10.0, card_rect.top() + 8.0),
+        Align2::LEFT_TOP,
+        "DYNO CURVE",
+        FontId::monospace(10.0),
+        TEXT_MUTED,
+    );
+    p.text(
+        Pos2::new(card_rect.right() - 48.0, card_rect.top() + 8.0),
+        Align2::RIGHT_TOP,
+        format!("{:.0} BHP @ {:.1}k  |  {:.0} Nm", peak_bhp, peak_bhp_rpm * 0.001, peak_nm),
+        FontId::monospace(9.5),
+        TEXT_PRIMARY,
+    );
+    let clr_rect = Rect::from_min_size(Pos2::new(card_rect.right() - 40.0, card_rect.top() + 5.0), Vec2::new(32.0, 16.0));
+    let clr_resp = ui.interact(clr_rect, ui.id().with("dyno_clr"), Sense::click());
+    if clr_resp.clicked() {
+        ctrl.clear_dyno_trace = true;
+    }
+    p.text(
+        clr_rect.center(),
+        Align2::CENTER_CENTER,
+        "CLR",
+        FontId::monospace(9.0),
+        if clr_resp.hovered() { ACCENT_RED } else { TEXT_MUTED },
+    );
+
+    let pad = Rect::from_min_max(
+        Pos2::new(card_rect.left() + 30.0, card_rect.top() + 28.0),
+        Pos2::new(card_rect.right() - 12.0, card_rect.bottom() - 20.0),
+    );
+
+    // Subtle horizontal & vertical reference grid with labeled ticks
+    for &(bhp_tick, lbl) in &[(250.0, "250"), (500.0, "500"), (750.0, "750"), (1000.0, "1k")] {
+        let y = pad.bottom() - (bhp_tick / 1000.0) * pad.height();
+        p.line_segment(
+            [Pos2::new(pad.left(), y), Pos2::new(pad.right(), y)],
+            Stroke::new(0.6_f32, Color32::from_rgb(20, 24, 32)),
+        );
+        p.text(Pos2::new(pad.left() - 4.0, y), Align2::RIGHT_CENTER, lbl, FontId::monospace(8.5), TEXT_MUTED);
+    }
+    let rpm_span = (DYNO_MAX_RPM - DYNO_MIN_RPM) as f32;
+    for &(rpm_tick, lbl) in &[(8000.0, "8k"), (12000.0, "12k"), (16000.0, "16k"), (20000.0, "20k")] {
+        let nx = ((rpm_tick - DYNO_MIN_RPM as f32) / rpm_span).clamp(0.0, 1.0);
+        let x = pad.left() + nx * pad.width();
+        p.line_segment(
+            [Pos2::new(x, pad.top()), Pos2::new(x, pad.bottom())],
+            Stroke::new(0.6_f32, Color32::from_rgb(20, 24, 32)),
+        );
+        p.text(Pos2::new(x, pad.bottom() + 4.0), Align2::CENTER_TOP, lbl, FontId::monospace(8.5), TEXT_MUTED);
+    }
+
+    let mut bhp_pts = Vec::new();
+    let mut nm_pts = Vec::new();
+    for i in 0..DYNO_BINS {
+        let pt = snap.dyno_curve[i];
+        if pt.recorded {
+            let mut sum_p = pt.power_bhp;
+            let mut sum_t = pt.torque_nm;
+            let mut w = 1.0_f32;
+            if i > 0 && snap.dyno_curve[i - 1].recorded {
+                sum_p += 0.45 * snap.dyno_curve[i - 1].power_bhp;
+                sum_t += 0.45 * snap.dyno_curve[i - 1].torque_nm;
+                w += 0.45;
+            }
+            if i + 1 < DYNO_BINS && snap.dyno_curve[i + 1].recorded {
+                sum_p += 0.45 * snap.dyno_curve[i + 1].power_bhp;
+                sum_t += 0.45 * snap.dyno_curve[i + 1].torque_nm;
+                w += 0.45;
+            }
+            let nx = ((pt.rpm - DYNO_MIN_RPM as f32) / rpm_span).clamp(0.0, 1.0);
+            let x = pad.left() + nx * pad.width();
+            bhp_pts.push(Pos2::new(x, pad.bottom() - ((sum_p / w) / 1000.0).clamp(0.0, 1.0) * pad.height()));
+            nm_pts.push(Pos2::new(x, pad.bottom() - ((sum_t / w) / 450.0).clamp(0.0, 1.0) * pad.height()));
+        }
+    }
+
+    // Subtle shaded ribbon under the recorded BHP curve
+    if bhp_pts.len() >= 2 {
+        let area_col = Color32::from_rgba_unmultiplied(72, 188, 120, 28);
+        for w in bhp_pts.windows(2) {
+            if (w[1].x - w[0].x).abs() > 0.5 && (pad.bottom() - w[0].y).max(pad.bottom() - w[1].y) > 0.5 {
+                let quad = vec![
+                    w[0],
+                    w[1],
+                    Pos2::new(w[1].x, pad.bottom()),
+                    Pos2::new(w[0].x, pad.bottom()),
+                ];
+                p.add(egui::Shape::convex_polygon(quad, area_col, Stroke::NONE));
+            }
+        }
+        p.add(egui::Shape::line(nm_pts, Stroke::new(1.5_f32, ACCENT_AMBER)));
+        p.add(egui::Shape::line(bhp_pts, Stroke::new(2.0_f32, ACCENT_GREEN)));
+    }
+
+    // Live RPM cursor
+    if snap.rpm >= DYNO_MIN_RPM as f64 {
+        let nx = (((snap.rpm as f32) - DYNO_MIN_RPM as f32) / rpm_span).clamp(0.0, 1.0);
+        let x = pad.left() + nx * pad.width();
+        let y_bhp = pad.bottom() - ((snap.power_bhp as f32) / 1000.0).clamp(0.0, 1.0) * pad.height();
+        p.line_segment(
+            [Pos2::new(x, pad.top()), Pos2::new(x, pad.bottom())],
+            Stroke::new(0.8_f32, Color32::from_rgba_unmultiplied(228, 232, 240, 45)),
+        );
+        p.circle_filled(Pos2::new(x, y_bhp), 3.5, TEXT_PRIMARY);
+    }
+}
+
+fn draw_diag_card(ui: &mut egui::Ui, snap: &TelemetrySnapshot, diag_plot: &mut DiagnosticPlot) {
+    let card_h = 182.0_f32;
+    let card_w = ui.available_width().max(260.0);
+    let (card_rect, _) = ui.allocate_exact_size(Vec2::new(card_w, card_h), Sense::hover());
+    let p = ui.painter_at(card_rect);
+    p.rect_filled(card_rect, 5.0, bg_card());
+    p.rect_stroke(card_rect, 5.0, Stroke::new(1.0_f32, BORDER_SUBTLE));
+
+    let tab1 = Rect::from_min_size(Pos2::new(card_rect.left() + 8.0, card_rect.top() + 5.0), Vec2::new(66.0, 17.0));
+    let tab2 = Rect::from_min_size(Pos2::new(card_rect.left() + 80.0, card_rect.top() + 5.0), Vec2::new(92.0, 17.0));
+    if ui.interact(tab1, ui.id().with("tab_pv"), Sense::click()).clicked() {
+        *diag_plot = DiagnosticPlot::PvDiagram;
+    }
+    if ui.interact(tab2, ui.id().with("tab_wave"), Sense::click()).clicked() {
+        *diag_plot = DiagnosticPlot::Waveform;
+    }
+    p.text(
+        tab1.center(),
+        Align2::CENTER_CENTER,
+        "P-V LOOP",
+        FontId::monospace(9.5),
+        if *diag_plot == DiagnosticPlot::PvDiagram { ACCENT_CYAN } else { TEXT_MUTED },
+    );
+    p.text(
+        tab2.center(),
+        Align2::CENTER_CENTER,
+        "EXHAUST WAVE",
+        FontId::monospace(9.5),
+        if *diag_plot == DiagnosticPlot::Waveform { ACCENT_CYAN } else { TEXT_MUTED },
+    );
+
+    let pad = Rect::from_min_max(
+        Pos2::new(card_rect.left() + 30.0, card_rect.top() + 28.0),
+        Pos2::new(card_rect.right() - 12.0, card_rect.bottom() - 16.0),
+    );
+
+    match *diag_plot {
+        DiagnosticPlot::PvDiagram => {
+            p.text(
+                Pos2::new(card_rect.right() - 10.0, card_rect.top() + 8.0),
+                Align2::RIGHT_TOP,
+                format!("{:.1} bar | {:.0} K", snap.cylinders[0].pressure_bar, snap.cylinders[0].temp_k),
+                FontId::monospace(9.5),
+                TEXT_PRIMARY,
+            );
+            for &(pr_tick, lbl) in &[(25.0, "25"), (50.0, "50"), (75.0, "75"), (100.0, "100")] {
+                let y = pad.bottom() - (pr_tick / 105.0) * pad.height();
+                p.line_segment(
+                    [Pos2::new(pad.left(), y), Pos2::new(pad.right(), y)],
+                    Stroke::new(0.6_f32, Color32::from_rgb(20, 24, 32)),
+                );
+                p.text(Pos2::new(pad.left() - 4.0, y), Align2::RIGHT_CENTER, lbl, FontId::monospace(8.5), TEXT_MUTED);
+            }
+
+            let v_min = (CLEARANCE_VOL_M3 * 1e6) as f32 * 0.9;
+            let v_max = ((CLEARANCE_VOL_M3 + DISP_VOL_M3) * 1e6) as f32 * 1.03;
+            let map_pt = |v: f32, pr: f32| -> Pos2 {
+                let nx = ((v - v_min) / (v_max - v_min)).clamp(0.0, 1.0);
+                let ny = (pr / 105.0).clamp(0.0, 1.0);
+                Pos2::new(pad.left() + nx * pad.width(), pad.bottom() - ny * pad.height())
+            };
+            let mut pts = Vec::with_capacity(PV_POINTS + 1);
+            let mut min_p = f32::MAX;
+            let mut max_p = f32::MIN;
+            for &(v, pr) in &snap.pv_trace {
+                min_p = min_p.min(pr);
+                max_p = max_p.max(pr);
+                pts.push(map_pt(v, pr));
+            }
+            // Subtle work-loop fill when cylinder loop has active pressure swing
+            if pts.len() >= 3 && (max_p - min_p) > 0.8 {
+                let fill_col = Color32::from_rgba_unmultiplied(92, 180, 230, 22);
+                let center = pts.iter().fold(Vec2::ZERO, |acc, &pt| acc + pt.to_vec2()) / pts.len() as f32;
+                let cp = center.to_pos2();
+                let n = pts.len();
+                for i in 0..n {
+                    let a = pts[i];
+                    let b = pts[(i + 1) % n];
+                    let area2 = (a.x - cp.x) * (b.y - cp.y) - (b.x - cp.x) * (a.y - cp.y);
+                    if area2.abs() > 1.0 {
+                        let tri = if area2 > 0.0 { vec![cp, a, b] } else { vec![cp, b, a] };
+                        p.add(egui::Shape::convex_polygon(tri, fill_col, Stroke::NONE));
+                    }
+                }
+            }
+            if let Some(&first) = pts.first() {
+                pts.push(first);
+            }
+            p.add(egui::Shape::line(pts, Stroke::new(1.7_f32, ACCENT_CYAN)));
+            let cur_v = ((CLEARANCE_VOL_M3 + snap.cylinders[0].piston_norm * DISP_VOL_M3) * 1e6) as f32;
+            p.circle_filled(map_pt(cur_v, snap.cylinders[0].pressure_bar as f32), 3.4, ACCENT_AMBER);
+        }
+        DiagnosticPlot::Waveform => {
+            let cy = pad.center().y;
+            p.line_segment(
+                [Pos2::new(pad.left(), cy), Pos2::new(pad.right(), cy)],
+                Stroke::new(0.8_f32, Color32::from_rgb(24, 29, 38)),
+            );
+            let mut pts_l = Vec::with_capacity(SCOPE_LEN);
+            let mut pts_r = Vec::with_capacity(SCOPE_LEN);
+            let mut pts_a = Vec::with_capacity(SCOPE_LEN);
+            let amp = pad.height() * 0.45;
+            for i in 0..SCOPE_LEN {
+                let x = pad.left() + (i as f32 / (SCOPE_LEN - 1) as f32) * pad.width();
+                pts_l.push(Pos2::new(x, cy - snap.scope_left[i].clamp(-1.0, 1.0) * amp));
+                pts_r.push(Pos2::new(x, cy - snap.scope_right[i].clamp(-1.0, 1.0) * amp));
+                pts_a.push(Pos2::new(x, cy - snap.scope_audio[i].clamp(-1.0, 1.0) * amp));
+            }
+            p.add(egui::Shape::line(pts_l, Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(92, 180, 230, 80))));
+            p.add(egui::Shape::line(pts_r, Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(222, 158, 62, 80))));
+            p.add(egui::Shape::line(pts_a, Stroke::new(1.6_f32, TEXT_PRIMARY)));
+        }
+    }
+}
+
+fn draw_vitals_strip(ui: &mut egui::Ui, snap: &TelemetrySnapshot, ctrl: &SharedControls) {
+    let strip_w = ui.available_width().max(260.0);
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(strip_w, 42.0), Sense::hover());
+    let p = ui.painter_at(rect);
+    p.rect_filled(rect, 5.0, bg_card());
+    p.rect_stroke(rect, 5.0, Stroke::new(1.0_f32, BORDER_SUBTLE));
+
+    let cells = [
+        ("BLOCK", format!("{:.0}°C", snap.coolant_temp_c), snap.coolant_temp_c > 112.0),
+        ("EGT", format!("{:.0}°C", snap.egt_c), snap.egt_c > 980.0),
+        ("VALVE N2", format!("{:.0} b", ctrl.n2_pressure_bar), snap.valve_float_active),
+        ("TRUMPET", format!("{:.0} mm", snap.trumpet_length_mm), false),
+    ];
+    let cw = rect.width() / 4.0;
+    for (i, (lbl, val, warn)) in cells.iter().enumerate() {
+        let cx = rect.left() + (i as f32 + 0.5) * cw;
+        if i > 0 {
+            let sx = rect.left() + i as f32 * cw;
+            p.line_segment(
+                [Pos2::new(sx, rect.top() + 7.0), Pos2::new(sx, rect.bottom() - 7.0)],
+                Stroke::new(0.8_f32, BORDER_SUBTLE),
+            );
+        }
+        p.text(Pos2::new(cx, rect.top() + 8.0), Align2::CENTER_TOP, *lbl, FontId::monospace(8.5), TEXT_MUTED);
+        p.text(
+            Pos2::new(cx, rect.top() + 21.0),
+            Align2::CENTER_TOP,
+            val,
+            FontId::monospace(10.5),
+            if *warn { ACCENT_RED } else { TEXT_PRIMARY },
+        );
+    }
 }
 
 fn compute_dyno_peaks(snap: &TelemetrySnapshot) -> (f32, f32, f32, f32) {
@@ -1895,126 +2014,6 @@ fn compute_dyno_peaks(snap: &TelemetrySnapshot) -> (f32, f32, f32, f32) {
         }
     }
     (pb, pb_r, pt, pt_r)
-}
-
-fn draw_frameless_dyno_plot(ui: &mut egui::Ui, snap: &TelemetrySnapshot) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(284.0, 150.0), Sense::hover());
-    let p = ui.painter_at(rect);
-    p.line_segment(
-        [Pos2::new(rect.left(), rect.bottom() - 1.0), Pos2::new(rect.right(), rect.bottom() - 1.0)],
-        Stroke::new(1.0_f32, BORDER_SUBTLE),
-    );
-    p.line_segment(
-        [Pos2::new(rect.left() + 1.0, rect.top()), Pos2::new(rect.left() + 1.0, rect.bottom())],
-        Stroke::new(1.0_f32, BORDER_SUBTLE),
-    );
-
-    let pad = rect.shrink(8.0);
-    for i in 1..4 {
-        let y = pad.bottom() - (i as f32 / 4.0) * pad.height();
-        p.line_segment([Pos2::new(pad.left(), y), Pos2::new(pad.right(), y)], Stroke::new(0.6_f32, Color32::from_rgb(18, 22, 28)));
-    }
-
-    let rpm_span = (DYNO_MAX_RPM - DYNO_MIN_RPM) as f32;
-    let mut bhp_pts = Vec::new();
-    let mut nm_pts = Vec::new();
-    for i in 0..DYNO_BINS {
-        let pt = snap.dyno_curve[i];
-        if pt.recorded {
-            let mut sum_p = pt.power_bhp;
-            let mut sum_t = pt.torque_nm;
-            let mut w = 1.0f32;
-            if i > 0 && snap.dyno_curve[i - 1].recorded {
-                sum_p += 0.45 * snap.dyno_curve[i - 1].power_bhp;
-                sum_t += 0.45 * snap.dyno_curve[i - 1].torque_nm;
-                w += 0.45;
-            }
-            if i + 1 < DYNO_BINS && snap.dyno_curve[i + 1].recorded {
-                sum_p += 0.45 * snap.dyno_curve[i + 1].power_bhp;
-                sum_t += 0.45 * snap.dyno_curve[i + 1].torque_nm;
-                w += 0.45;
-            }
-            let nx = ((pt.rpm - DYNO_MIN_RPM as f32) / rpm_span).clamp(0.0, 1.0);
-            let x = pad.left() + nx * pad.width();
-            bhp_pts.push(Pos2::new(x, pad.bottom() - ((sum_p / w) / 1000.0).clamp(0.0, 1.0) * pad.height()));
-            nm_pts.push(Pos2::new(x, pad.bottom() - ((sum_t / w) / 450.0).clamp(0.0, 1.0) * pad.height()));
-        }
-    }
-    if nm_pts.len() >= 2 {
-        p.add(egui::Shape::line(nm_pts, Stroke::new(1.4_f32, ACCENT_AMBER)));
-    }
-    if bhp_pts.len() >= 2 {
-        p.add(egui::Shape::line(bhp_pts, Stroke::new(1.8_f32, ACCENT_GREEN)));
-    }
-    if snap.rpm >= DYNO_MIN_RPM as f64 {
-        let nx = (((snap.rpm as f32) - DYNO_MIN_RPM as f32) / rpm_span).clamp(0.0, 1.0);
-        let x = pad.left() + nx * pad.width();
-        let y_bhp = pad.bottom() - ((snap.power_bhp as f32) / 1000.0).clamp(0.0, 1.0) * pad.height();
-        p.circle_filled(Pos2::new(x, y_bhp), 3.0, TEXT_PRIMARY);
-    }
-    p.text(Pos2::new(pad.left() + 4.0, pad.top()), Align2::LEFT_TOP, "1000 BHP / 450 Nm", FontId::monospace(9.0), TEXT_MUTED);
-    p.text(Pos2::new(pad.right(), pad.bottom() - 2.0), Align2::RIGHT_BOTTOM, "5k-20k RPM", FontId::monospace(9.0), TEXT_MUTED);
-}
-
-fn draw_frameless_pv_plot(ui: &mut egui::Ui, snap: &TelemetrySnapshot) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(284.0, 140.0), Sense::hover());
-    let p = ui.painter_at(rect);
-    p.line_segment(
-        [Pos2::new(rect.left(), rect.bottom() - 1.0), Pos2::new(rect.right(), rect.bottom() - 1.0)],
-        Stroke::new(1.0_f32, BORDER_SUBTLE),
-    );
-    p.line_segment(
-        [Pos2::new(rect.left() + 1.0, rect.top()), Pos2::new(rect.left() + 1.0, rect.bottom())],
-        Stroke::new(1.0_f32, BORDER_SUBTLE),
-    );
-
-    let pad = rect.shrink(8.0);
-    let v_min = (CLEARANCE_VOL_M3 * 1e6) as f32 * 0.9;
-    let v_max = ((CLEARANCE_VOL_M3 + DISP_VOL_M3) * 1e6) as f32 * 1.03;
-    let map_pt = |v: f32, pr: f32| -> Pos2 {
-        let nx = ((v - v_min) / (v_max - v_min)).clamp(0.0, 1.0);
-        let ny = (pr / 105.0).clamp(0.0, 1.0);
-        Pos2::new(pad.left() + nx * pad.width(), pad.bottom() - ny * pad.height())
-    };
-    let mut pts = Vec::with_capacity(PV_POINTS + 1);
-    for &(v, pr) in &snap.pv_trace {
-        pts.push(map_pt(v, pr));
-    }
-    if let Some(&first) = pts.first() {
-        pts.push(first);
-    }
-    p.add(egui::Shape::line(pts, Stroke::new(1.5_f32, ACCENT_CYAN)));
-    let cur_v = ((CLEARANCE_VOL_M3 + snap.cylinders[0].piston_norm * DISP_VOL_M3) * 1e6) as f32;
-    p.circle_filled(map_pt(cur_v, snap.cylinders[0].pressure_bar as f32), 3.0, ACCENT_AMBER);
-    p.text(
-        Pos2::new(pad.left() + 4.0, pad.top()),
-        Align2::LEFT_TOP,
-        format!("{:.1} bar | {:.0} K", snap.cylinders[0].pressure_bar, snap.cylinders[0].temp_k),
-        FontId::monospace(9.0),
-        TEXT_MUTED,
-    );
-}
-
-fn draw_frameless_scope_plot(ui: &mut egui::Ui, snap: &TelemetrySnapshot) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(284.0, 140.0), Sense::hover());
-    let p = ui.painter_at(rect);
-    let pad = rect.shrink(8.0);
-    let cy = pad.center().y;
-    p.line_segment([Pos2::new(pad.left(), cy), Pos2::new(pad.right(), cy)], Stroke::new(0.8_f32, Color32::from_rgb(22, 26, 33)));
-
-    let mut pts_l = Vec::with_capacity(SCOPE_LEN);
-    let mut pts_r = Vec::with_capacity(SCOPE_LEN);
-    let mut pts_a = Vec::with_capacity(SCOPE_LEN);
-    let amp = pad.height() * 0.44;
-    for i in 0..SCOPE_LEN {
-        let x = pad.left() + (i as f32 / (SCOPE_LEN - 1) as f32) * pad.width();
-        pts_l.push(Pos2::new(x, cy - snap.scope_left[i].clamp(-1.0, 1.0) * amp));
-        pts_r.push(Pos2::new(x, cy - snap.scope_right[i].clamp(-1.0, 1.0) * amp));
-        pts_a.push(Pos2::new(x, cy - snap.scope_audio[i].clamp(-1.0, 1.0) * amp));
-    }
-    p.add(egui::Shape::line(pts_l, Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(92, 180, 230, 85))));
-    p.add(egui::Shape::line(pts_r, Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(222, 158, 62, 85))));
-    p.add(egui::Shape::line(pts_a, Stroke::new(1.4_f32, TEXT_PRIMARY)));
 }
 
 fn gas_color(cyl: &crate::sim::CylinderSnapshot) -> Color32 {
